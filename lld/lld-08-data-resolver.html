@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 08 — Data Resolver | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html" class="active">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 08 — Data Resolver <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <h1>LLD 08 — Data Resolver</h1>
+  <p class="page-intro">
+    Resolves widget SQL templates to tenant-specific queries via the schema registry, and serves live widget data —
+    switching a widget from sample to live the moment all its tables are mapped and validated.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Bridges the gap between the platform's generic widget SQL templates and each client's actual database. Widget templates use placeholders like <code>&#123;&#123;hr_employees&#125;&#125;</code>. This layer takes the admin's confirmed mapping of that placeholder to their real table name and renders actual SQL.</p>
+    <p>Before any query ever runs, it runs <code>EXPLAIN</code> on the client's read-only replica — this validates that all column names and tables exist without executing the query or touching any rows. Only after EXPLAIN passes is the query marked verified and the widget flips from sample mode to live. <strong>LLM output from generation is never executed as SQL at request time</strong> — all queries come from reviewed templates. Every query runs under a per-client credential scoped only to that client's mapped tables.</p>
+    <p>Live query results are cached in Redis by refresh class (realtime, hourly, or daily). When the client's underlying data changes — detected via Kafka change-data-capture events from Debezium — the corresponding cache keys are deleted immediately. Bulk data loads are debounced to collapse many rapid events into a single invalidation.</p>
+  </div>
+
+  <!-- 1. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> Admin confirms table mapping (step 5 of LLD 1 or admin UI); <code>GET /api/widgets/{id}/data</code>; Kafka CDC events<br/>
+    <strong>Outputs:</strong> Live widget data rows (→ LLD 7 cache); live/sample mode flag (→ bundle re-tag in LLD 3); wdata invalidation signals (→ LLD 7)
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["Admin UI\n(table mapping confirm)"] --> B["LLD 8\nData Resolver"]
+    C["GET /api/widgets/{id}/data"] --> B
+    D["Kafka CDC\n(Debezium)"] --> B
+    B --> E["wdata:* in LLD 7\n(Redis cache)"]
+    B --> F["fn_live_widgets\n→ bundle re-tag LLD 3"]
+    B --> G["Read-only replica\n(SQL execute)"]
+    </div>
+  </div>
+
+  <!-- 2. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Admin confirms generic_name → actual_name</td>
+          <td><code>{tenant_id, generic_name, actual_name, db_schema}</code></td>
+          <td>Admin UI</td>
+          <td>fn_register_table → QueryRenderJob fan-out</td>
+        </tr>
+        <tr>
+          <td><code>GET /api/widgets/{id}/data</code></td>
+          <td><code>{widget_id, tenant_id, user_id, data_scope}</code></td>
+          <td>Client app</td>
+          <td>Data fetch handler (Redis check → SQL)</td>
+        </tr>
+        <tr>
+          <td>Kafka CDC: table row change</td>
+          <td><code>{topic: tenant.{tenant_id}.changes, table, row_id}</code></td>
+          <td>Debezium → Kafka</td>
+          <td>CacheInvalidationConsumer</td>
+        </tr>
+        <tr>
+          <td>QueryRenderJob complete</td>
+          <td><code>{tenant_id, widget_id, resolved_sql}</code></td>
+          <td>QueryRenderJob (this)</td>
+          <td>EXPLAIN validator → verified=true → fn_live_widgets</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Schema Registration Flow</div>
+    <p><strong>Responsibility:</strong> Triggered by LLD 1 step 5 or admin UI. Accepts the admin's confirmation of <code>generic_name → actual_name</code>, writes the registry row, invalidates pre-rendered SQL for every affected widget, then fans out QueryRenderJob for each.</p>
+    <p><strong>Steps:</strong></p>
+    <ol style="margin:8px 0 8px 20px;font-size:0.875rem;color:var(--txt)">
+      <li>Admin confirms mapping in UI.</li>
+      <li><code>fn_register_table</code> upserts <code>tenant_schema_registry</code> (verified=false), deletes affected <code>tenant_widget_queries</code> rows.</li>
+      <li>Fan out <code>QueryRenderJob(tenant_id, widget_id)</code> for every widget that uses the alias.</li>
+      <li>EXPLAIN validator runs on read-only replica.</li>
+      <li>Pass → <code>verified=true</code>; fail → error stored, admin notified.</li>
+      <li><code>fn_live_widgets(tenant_id)</code> recomputed; <code>data_mode_version</code> bumped; bundles re-tagged (live/sample) without full rebuild.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <div class="card-title">fn_register_table(tenant_id, generic_name, actual_name, db_schema)</div>
+    <p><strong>Responsibility:</strong> Upserts into <code>tenant_schema_registry</code> with <code>verified=false</code>. Deletes all <code>tenant_widget_queries</code> rows for this tenant that reference the alias so they are re-rendered from scratch.</p>
+    <p><strong>Interface:</strong> <code>fn_register_table(tenant_id, generic_name, actual_name, db_schema) → void</code> (Postgres function, already in schema.sql)</p>
+    <p><strong>Writes:</strong> <code>tenant_schema_registry</code> (upsert), <code>tenant_widget_queries</code> (delete invalidated rows)</p>
+    <p><strong>Idempotency:</strong> Upsert on <code>(tenant_id, generic_name)</code>; re-registering same actual_name is a no-op beyond the delete.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">QueryRenderJob(tenant_id, widget_id)</div>
+    <p><strong>Responsibility:</strong> Reads <code>data_query_template</code> from the <code>widgets</code> table, substitutes all <code>&#123;&#123;alias&#125;&#125;</code> placeholders with the tenant's confirmed <code>actual_name</code> values from the registry, and stores the result in <code>tenant_widget_queries.resolved_sql</code>.</p>
+    <p><strong>Interface:</strong> <code>QueryRenderJob.run(tenant_id, widget_id) → void</code></p>
+    <p><strong>Reads:</strong> <code>widgets.data_query_template</code>, <code>tenant_schema_registry</code> (confirmed mappings only)</p>
+    <p><strong>Writes:</strong> <code>tenant_widget_queries</code> (upsert resolved_sql)</p>
+    <p><strong>Failure handling:</strong> Missing mapping for an alias → job fails cleanly; widget stays in sample mode; admin notified with the unresolved alias name.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">EXPLAIN Validator</div>
+    <p><strong>Responsibility:</strong> Runs <code>EXPLAIN</code> (never <code>EXECUTE</code>) on the resolved SQL against the tenant's read-only replica under the tenant's read-only DB role. Validates column names and table existence. Reports the exact failing column or table in the error.</p>
+    <p><strong>Interface:</strong> <code>ExplainValidator.validate(tenant_id, widget_id, resolved_sql) → {ok: bool, error?: string}</code></p>
+    <p><strong>Timeout:</strong> <code>EXPLAIN_VALIDATION_TIMEOUT_MS</code> <span class="tbd">TBD</span></p>
+    <p><strong>Writes on pass:</strong> <code>tenant_schema_registry.verified=true</code> for affected aliases</p>
+    <p><strong>Writes on fail:</strong> <code>tenant_widget_queries.validation_error</code> stored; widget remains sample</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">fn_live_widgets(tenant_id)</div>
+    <p><strong>Responsibility:</strong> Returns the set of widget slugs for which all required data sources have a verified mapping in <code>tenant_schema_registry</code>. Called after each successful EXPLAIN validation to recompute the live set without a full bundle rebuild.</p>
+    <p><strong>Interface:</strong> <code>fn_live_widgets(tenant_id) → widget_slug[]</code> (Postgres function, already in schema.sql)</p>
+    <p><strong>Reads:</strong> <code>widget_data_sources</code>, <code>tenant_schema_registry</code></p>
+    <p><strong>Effect:</strong> Bundles re-tag widgets live/sample; <code>data_mode_version</code> bumped so stale bundles are detected.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">GET /api/widgets/{id}/data — Data Fetch Handler</div>
+    <p><strong>Responsibility:</strong> Authoritative data endpoint. Checks <code>wdata:{widget_id}:{tenant_id}:{scope}</code> in Redis first. On hit, returns immediately. On miss: run <code>resolved_sql</code> on read-only replica under tenant's DB role (statement_timeout + row_limit enforced); cache result with TTL per refresh class; return rows.</p>
+    <p><strong>Sample mode:</strong> Widget without a verified resolved_sql returns the bundled sample dataset instead of executing SQL.</p>
+    <p><strong>Security:</strong> SQL comes only from reviewed templates with validated identifiers. Never from LLM output at request time. Every query runs under a per-tenant credential with access only to that tenant's mapped tables.</p>
+    <p><strong>Failure handling:</strong> Statement timeout → return error + serve stale cache if available. Row limit exceeded → return truncated rows + warning header.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">CacheInvalidationConsumer</div>
+    <p><strong>Responsibility:</strong> Consumes Debezium → Kafka topic <code>tenant.{tenant_id}.changes</code>. Maps changed table → alias → widgets that need that alias. Deletes <code>wdata:*</code> keys and dependent <code>rag:*</code> keys for each affected widget/tenant pair. Debounces bulk loads into one invalidation per window.</p>
+    <p><strong>Interface:</strong> Kafka consumer group; processes messages in order per tenant partition.</p>
+    <p><strong>Debounce:</strong> <code>CDC_DEBOUNCE_WINDOW_MS</code> <span class="tbd">TBD</span> — multiple CDC events for the same table within the window collapse to one invalidation.</p>
+    <p><strong>Failure handling:</strong> Consumer lag monitored; if lag exceeds threshold, stale data risk must be alerted. Dead-letter queue for unparseable events.</p>
+  </div>
+
+  <!-- 4. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Admin
+    participant API as Registration API
+    participant FRT as fn_register_table
+    participant QRJ as QueryRenderJob
+    participant EV as EXPLAIN Validator
+    participant FLW as fn_live_widgets
+    participant LLD3 as LLD 3 Bundle
+    participant Client
+    participant Cache as Redis (LLD 7)
+    participant DB as Read-only Replica
+
+    Admin->>API: confirm generic_name → actual_name
+    API->>FRT: fn_register_table(tenant_id, …)
+    FRT->>FRT: upsert registry, delete old tenant_widget_queries
+    FRT->>QRJ: fan-out QueryRenderJob per affected widget
+    QRJ->>QRJ: substitute aliases → resolved_sql
+    QRJ->>EV: validate(resolved_sql)
+    alt EXPLAIN pass
+        EV-->>QRJ: ok → verified=true
+        QRJ->>FLW: fn_live_widgets(tenant_id)
+        FLW->>LLD3: re-tag bundles live/sample
+    else EXPLAIN fail
+        EV-->>QRJ: error → store error, notify admin
+    end
+
+    Client->>API: GET /api/widgets/{id}/data
+    API->>Cache: check wdata:{widget_id}:{tenant_id}:{scope}
+    alt Cache hit
+        Cache-->>API: rows
+        API-->>Client: rows
+    else Cache miss
+        API->>DB: run resolved_sql (statement_timeout + row_limit)
+        DB-->>API: rows
+        API->>Cache: SET wdata:* TTL per refresh class
+        API-->>Client: rows
+    end
+    </div>
+  </div>
+
+  <!-- 5. Redis Keys -->
+  <h2>5 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>Holds</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr><td><code>wdata:{widget_id}:{tenant_id}:{scope}</code></td><td>JSON string</td><td>Query result rows for this widget/tenant/scope</td><td>Per refresh class <span class="tbd">TBD</span></td><td>CDC event for any source table of this widget</td></tr>
+        <tr><td><code>rag:{hash}:{data_v}</code></td><td>string</td><td>Cached LLM answer (depends on data_v)</td><td><code>RAG_CACHE_TTL_SECONDS</code> <span class="tbd">TBD</span></td><td>data_version change, TTL</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 6. Tables Touched -->
+  <h2>6 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>tenant_schema_registry</code></td><td>R/W</td><td><a href="../schema.html#tenant_schema_registry">schema → tenant_schema_registry</a></td></tr>
+        <tr><td><code>tenant_widget_queries</code></td><td>R/W</td><td><a href="../schema.html#tenant_widget_queries">schema → tenant_widget_queries</a></td></tr>
+        <tr><td><code>widgets</code></td><td>R (data_query_template)</td><td><a href="../schema.html#widgets">schema → widgets</a></td></tr>
+        <tr><td><code>widget_data_sources</code></td><td>R</td><td><a href="../schema.html#widget_data_sources">schema → widget_data_sources</a></td></tr>
+        <tr><td><code>data_sources</code></td><td>R</td><td><a href="../schema.html#data_sources">schema → data_sources</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 7. Config Values -->
+  <h2>7 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>QUERY_STATEMENT_TIMEOUT_MS</code></td><td>Max wall-clock time for any tenant SQL execution</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>QUERY_ROW_LIMIT</code></td><td>Max rows returned per widget data fetch</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>CDC_DEBOUNCE_WINDOW_MS</code></td><td>Window to collapse bulk CDC events per table into one invalidation</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>EXPLAIN_VALIDATION_TIMEOUT_MS</code></td><td>Max time allowed for EXPLAIN run on read-only replica</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Security Note -->
+  <h2>8 · Security Note</h2>
+  <div class="open-q" style="border-color:var(--accent);">
+    <div class="open-q-title" style="color:var(--accent)">Security invariants</div>
+    <ul>
+      <li>SQL comes only from reviewed templates with validated identifiers. LLM output is never executed as SQL at request time.</li>
+      <li>Every query runs under a per-tenant DB credential that is read-only and scoped to that tenant's mapped tables only.</li>
+      <li>EXPLAIN is run before any execution; a template that fails EXPLAIN can never reach execution.</li>
+      <li>The <code>data_scope</code> filter (self/team/department/company) is applied as a mandatory SQL predicate injected by LLD 10, never in the UI.</li>
+    </ul>
+  </div>
+
+  <!-- 9. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-01-ingestion.html">LLD 1 — Ingestion</a></td><td>Admin confirms table mappings (step 5); triggers registration flow</td></tr>
+        <tr><td>In ←</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>data_scope filter injected as mandatory SQL predicate per request</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td>Writes/reads <code>wdata:*</code>; CacheInvalidationConsumer deletes stale keys</td></tr>
+        <tr><td>Out →</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td>live/sample mode flag via <code>fn_live_widgets</code> → bundle re-tag</td></tr>
+        <tr><td>Out →</td><td>Kafka (Debezium)</td><td>Consumes <code>tenant.{tenant_id}.changes</code> for CDC invalidation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Tenant maps alias to a non-existent table — EXPLAIN fails, widget stays in sample mode; admin receives exact error (table not found).</li>
+      <li>Bulk data load triggers many CDC events in rapid succession — debounce collapses them; brief window of stale cache acceptable per refresh class contract.</li>
+      <li>Resolved SQL becomes invalid after tenant DB schema change (column renamed) — EXPLAIN fails on next access; widget falls back to sample; admin notified to re-map.</li>
+      <li>Two widgets sharing the same alias that one tenant has not yet mapped — only the unmapped widget stays in sample; the other goes live independently.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>Should EXPLAIN validation run periodically (e.g., nightly) to catch silent tenant schema drift, or only on mapping change and access?</li>
+      <li>What is the observable behaviour when a widget is mid-transition from sample to live during an active user session?</li>
+      <li>Kafka consumer group per tenant vs. shared consumer with tenant filtering — throughput vs. operational simplicity trade-off.</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) sources[id] = el.textContent.trim();
+    });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme','dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme','light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  const saved = localStorage.getItem('theme');
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (saved === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 06 — Question Router | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html" class="active">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 06 — Question Router <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 06 — Question Router</h1>
+  <p class="page-intro">
+    Matches a user's natural-language question to the right widget(s) using bucket-first vector + keyword search,
+    boosts by session transition probability, and returns a grounded LLM answer.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>The employee-facing intelligence layer. An employee types a question; this returns a grounded answer using live data from that client's database. The flow on a cache miss:</p>
+    <ol>
+      <li>Normalise the question text and compute a deterministic cache key.</li>
+      <li>Search the Redis semantic question index for matching questions in the employee's bucket — filtered by their access level before ranking.</li>
+      <li>Apply a session boost: if they just asked question A, and question B typically follows A in session history, boost B's score.</li>
+      <li>If nothing clears the match threshold, <strong>widen</strong> — first to secondary buckets, then to the global widget library. A global library hit is logged as a gap signal and sent to the Reuse Ladder (LLD 04), since this responsibility probably needs its own widget in this bucket.</li>
+      <li>Access Guard is checked again before any data is passed to the LLM.</li>
+      <li>The LLM composes a grounded answer using widget data and the matched questions as context.</li>
+      <li>Answer is cached in Redis and logged.</li>
+      <li>The next-question predictor suggests follow-ups from session history and pre-warms those widgets' data in Redis.</li>
+    </ol>
+    <p>Every unanswered question is flagged as novel and sent to the Feedback Loop (LLD 09) for cluster analysis — if enough different employees ask similar unmatched questions, a new widget will eventually be generated to answer them.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Input:</strong> <code>POST /api/ask {user_id, session_id, text}</code><br/>
+    <strong>Outputs:</strong> Answer + follow-up suggestions to employee; novel questions / transitions → LLD 9; global-hit gaps → LLD 4; question signals → LLD 11
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["POST /api/ask\n(user_id, session_id, text)"] --> B["LLD 6\nQuestion Router"]
+    B --> C["Answer + follow-ups\n→ Employee"]
+    B --> D["Novel questions / transitions\n→ LLD 9"]
+    B --> E["Global-hit gaps\n→ LLD 4"]
+    B --> F["Question signals\n→ LLD 11"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>POST /api/ask</code></td>
+          <td><code>{user_id, session_id, text}</code></td>
+          <td>Employee (frontend)</td>
+          <td>Normalizer + Hasher (this LLD)</td>
+        </tr>
+        <tr>
+          <td>Cache hit</td>
+          <td>Cached answer JSON</td>
+          <td>Redis <code>rag:{hash}:{data_v}</code></td>
+          <td>Answer returned immediately</td>
+        </tr>
+        <tr>
+          <td>Novel question detected</td>
+          <td><code>{text, user_id, bucket_id, session_id}</code></td>
+          <td>Logger (this LLD)</td>
+          <td>LLD 9 Feedback Loop</td>
+        </tr>
+        <tr>
+          <td>Global-hit gap candidate</td>
+          <td><code>{responsibility_id, bucket_id, widget_id_matched}</code></td>
+          <td>Widening Logic (this LLD)</td>
+          <td>LLD 4 Reuse Ladder</td>
+        </tr>
+        <tr>
+          <td>Question signal</td>
+          <td><code>{question_id, user_id, bucket_id}</code></td>
+          <td>Logger (this LLD)</td>
+          <td>LLD 11 Bucket Learner</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Normalizer + Hasher</div>
+    <p><strong>Responsibility:</strong> Normalise text (lowercase, strip punctuation), compute cache key hash = <code>sha256(normalized_text + bucket_id + access_scope)</code>; check <code>rag:{hash}:{data_v}</code> in Redis.</p>
+    <p><strong>Interface:</strong> <code>normalizeAndHash(text, bucket_id, access_scope) → {normalized: string, hash: string, cacheHit?: AnswerJSON}</code></p>
+    <p><strong>Reads:</strong> Redis <code>rag:{hash}:{data_v}</code></p>
+    <p><strong>Writes:</strong> None</p>
+    <p><strong>Idempotency:</strong> Deterministic hash; same question from same user always produces the same key.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bucket-First Search</div>
+    <p><strong>Responsibility:</strong> Vector + keyword search over questions linked to widgets in the user's bucket, served from the <code>qidx:bucket</code> RediSearch HNSW index. Candidates filtered by Access Guard (LLD 10) before ranking. Accept every widget whose best question match clears <code>ROUTING_THRESHOLD</code>.</p>
+    <p><strong>Interface:</strong> <code>bucketFirstSearch(normalized_text, bucket_id, user_id) → Candidate[]</code></p>
+    <p><strong>Reads:</strong> Redis <code>qidx:bucket</code> (RediSearch HNSW); LLD 10 <code>can_access</code></p>
+    <p><strong>Writes:</strong> None</p>
+    <p><strong>Failure handling:</strong> RediSearch index miss (new bucket, empty) → widening logic handles.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Session Boost</div>
+    <p><strong>Responsibility:</strong> If the session has a previous question, add transition probability <code>P(candidate | previous_question)</code> from <code>question_transitions</code> to each candidate's score.</p>
+    <p><strong>Interface:</strong> <code>applySessionBoost(candidates: Candidate[], session_id) → Candidate[]</code></p>
+    <p><strong>Reads:</strong> <code>question_transitions</code> (by previous question ID → candidate question ID)</p>
+    <p><strong>Writes:</strong> None</p>
+    <p><strong>Failure handling:</strong> No previous question in session → no boost applied; candidates returned with base scores.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Widening Logic</div>
+    <p><strong>Responsibility:</strong> If nothing clears <code>ROUTING_THRESHOLD</code> after bucket-first + session boost: widen to secondary buckets (including inferred from LLD 11) → then global library. A global hit records a gap candidate for LLD 4. Access filter applied at every widening level.</p>
+    <p><strong>Interface:</strong> <code>widenSearch(normalized_text, user_id, failedBucketId) → {candidates: Candidate[], globalHit: bool}</code></p>
+    <p><strong>Reads:</strong> Redis secondary bucket indexes, global <code>qidx</code>; LLD 10 access filter</p>
+    <p><strong>Writes:</strong> Gap candidate signal → LLD 4 (async, non-blocking)</td></tr>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Answer Generator (LLM)</div>
+    <p><strong>Responsibility:</strong> Receive widget data + matched questions; produce a grounded answer. Access Guard runs again before passing data to the LLM (double-check in case access changed since initial filter).</p>
+    <p><strong>Interface:</strong> <code>generateAnswer(widget_data, matched_questions, user_id) → AnswerJSON</code></p>
+    <p><strong>Reads:</strong> Widget data from LLD 8 (<code>wdata:{widget_id}:{tenant_id}:{scope}</code>); LLD 10 access re-check</p>
+    <p><strong>Writes:</strong> Redis <code>rag:{hash}:{data_v}</code> (SET with TTL = <code>RAG_CACHE_TTL_SECONDS</code>); <code>rag_answers</code> table</p>
+    <p><strong>Failure handling:</strong> LLM failure → return error response; do not cache failures.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Next-Question Predictor</div>
+    <p><strong>Responsibility:</strong> From <code>question_transitions</code>, take likely next questions above <code>TRANSITION_PROBABILITY_FLOOR</code>; return as suggested follow-ups. Pre-warm their widgets' data in Redis by enqueuing lightweight data refresh jobs.</p>
+    <p><strong>Interface:</strong> <code>predictNextQuestions(matched_question_id, bucket_id) → SuggestedQuestion[]</code></p>
+    <p><strong>Reads:</strong> <code>question_transitions</code></p>
+    <p><strong>Writes:</strong> Enqueue data pre-warm for suggested widget IDs (async)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Logger</div>
+    <p><strong>Responsibility:</strong> Write <code>question_log</code> row for every request: <code>{user_id, session_id, seq, text, matched_question_id or null, widget_id, scores}</code>. Unmatched text is flagged as a novel question for LLD 9.</p>
+    <p><strong>Interface:</strong> <code>logQuestion(request, result) → void</code></p>
+    <p><strong>Writes:</strong> <code>question_log</code>; novel question signal → LLD 9 (async)</p>
+    <p><strong>Failure handling:</strong> Log write failure is non-blocking; answer is returned regardless.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Transition Learner (nightly job)</div>
+    <p><strong>Responsibility:</strong> Read consecutive question pairs per session, map to canonical question IDs, update pair counts in <code>question_transitions</code>. Apply smoothing and time decay. Novel questions join the transition graph once promoted by LLD 9.</p>
+    <p><strong>Interface:</strong> <code>TransitionLearner.run(date) → void</code></p>
+    <p><strong>Reads:</strong> <code>question_log</code></p>
+    <p><strong>Writes:</strong> <code>question_transitions</code> (upsert counts + decayed weights)</p>
+    <p><strong>Idempotency:</strong> Re-running for the same date is safe (upsert on (q_from, q_to, bucket_id)).</p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Emp as Employee
+    participant API
+    participant NH as Normalizer + Hasher
+    participant Redis
+    participant BFS as Bucket-First Search
+    participant AG as Access Guard (LLD 10)
+    participant SB as Session Boost
+    participant Widen as Widening Logic
+    participant LLM as Answer Generator
+    participant NQP as Next-Q Predictor
+    participant Log as Logger
+
+    Emp->>API: POST /api/ask
+    API->>NH: normalize + hash
+    NH->>Redis: GET rag:{hash}:{data_v}
+    alt Cache hit
+        Redis-->>API: cached answer
+        API-->>Emp: answer
+    else Cache miss
+        NH->>BFS: bucket-first vector+keyword search
+        BFS->>AG: filter candidates by access
+        AG-->>BFS: allowed candidates
+        BFS->>SB: apply session boost
+        alt Above ROUTING_THRESHOLD
+            SB->>LLM: generate answer (widget data + questions)
+            LLM->>AG: re-check access before data → LLM
+            LLM-->>Redis: SET rag:{hash}:{data_v} (TTL 3600s)
+            LLM-->>API: answer
+            SB->>NQP: predict follow-ups + pre-warm
+            NQP-->>API: suggested follow-ups
+            API-->>Emp: answer + follow-ups
+        else Below threshold
+            SB->>Widen: widen to secondary + global
+            Widen-->>LLM: widened candidates (if any)
+            Widen-->>LLD4: global-hit gap candidate (async)
+            LLM-->>API: answer (or "no widget found")
+            API-->>Emp: answer
+        end
+        API->>Log: log question (async)
+        Log-->>LLD9: novel question signal (async)
+    end
+    </div>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>5 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>rag:{hash}:{data_v}</code></td>
+          <td>String (JSON answer)</td>
+          <td><code>RAG_CACHE_TTL_SECONDS</code> (default 3600s) <span class="tbd">TBD</span></td>
+          <td>Data version change (new <code>data_v</code> produces a new key; old key expires by TTL)</td>
+        </tr>
+        <tr>
+          <td><code>qidx:bucket</code></td>
+          <td>RediSearch index (question vectors + text, tagged bucket_id + widget_id)</td>
+          <td>No TTL (managed by LLD 7)</td>
+          <td>New widget / question added → LLD 7 updates index; bucket deprecated → entries removed</td>
+        </tr>
+        <tr>
+          <td><code>wdata:{widget_id}:{tenant_id}:{scope}</code></td>
+          <td>JSON (widget data)</td>
+          <td>Per refresh class (set by LLD 8)</td>
+          <td>Data resolver refresh; LLD 7 invalidation</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Tables Touched -->
+  <h2>6 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>question_log</code></td><td>W (insert per request)</td><td><a href="../schema.html#question_log">schema → question_log</a></td></tr>
+        <tr><td><code>rag_answers</code></td><td>W (insert on LLM generation)</td><td><a href="../schema.html#rag_answers">schema → rag_answers</a></td></tr>
+        <tr><td><code>question_transitions</code></td><td>R (session boost); W nightly (transition learner)</td><td><a href="../schema.html#question_transitions">schema → question_transitions</a></td></tr>
+        <tr><td><code>questions</code></td><td>R (canonical question lookup)</td><td><a href="../schema.html#questions">schema → questions</a></td></tr>
+        <tr><td><code>widget_questions</code></td><td>R (question → widget mapping)</td><td><a href="../schema.html#widget_questions">schema → widget_questions</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>7 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>ROUTING_THRESHOLD</code></td><td>Minimum combined score (vector + session boost) for a widget to be returned as a match</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>TRANSITION_PROBABILITY_FLOOR</code></td><td>Minimum transition probability for a follow-up question to be suggested</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>SESSION_BOOST_WEIGHT</code></td><td>Weight applied to transition probability when added to base routing score</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>RAG_CACHE_TTL_SECONDS</code></td><td>TTL for cached answers in Redis (default 3600)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>TRANSITION_DECAY_FACTOR</code></td><td>Exponential decay factor applied to transition counts during nightly rebuild</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>8 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td><code>qidx:bucket</code> question index; <code>wdata</code> widget data cache</td></tr>
+        <tr><td>In ←</td><td><a href="lld-08-data-resolver.html">LLD 8 — Data Resolver</a></td><td>Live widget data for answer generation</td></tr>
+        <tr><td>In ←</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td><code>can_access</code> per widget, per user</td></tr>
+        <tr><td>Out →</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td>Global-hit gap candidates (async signal)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-09-feedback-loop.html">LLD 9 — Feedback Loop</a></td><td>Novel questions + transition data</td></tr>
+        <tr><td>Out →</td><td><a href="lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></td><td>Question signals for inferred secondary bucket detection</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>9 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>No widgets in bucket (new tenant, empty bucket) → bucket-first search returns zero candidates; widening goes straight to global search. If still no match, return "no answer available yet" with "being set up" message.</li>
+      <li>Session with no previous question → no boost applied; candidates ranked purely by vector + keyword score.</li>
+      <li>Multiple widgets tie on score above threshold → return all of them; employee sees all matched widgets, not just the top one.</li>
+      <li>Question that matches only access-denied widgets → do not surface those widgets; reply "restricted for your role" and offer allowed alternatives if any exist above threshold.</li>
+      <li>Cache hit but data version has changed (<code>data_v</code> differs) → miss; new answer generated with fresh data; old key orphaned until TTL expiry.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>How should <code>access_scope</code> be included in the cache key hash — as a stable string representation of the user's current permission set? This must not change silently when permissions change.</li>
+      <li>Should transition probability decay be applied per bucket (heavier decay on low-activity buckets) or globally?</li>
+      <li>When widening to the global library hits a match, should that result always record a gap candidate for LLD 4, or only when the match is below a quality threshold?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (el) sources[id] = el.textContent.trim(); });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (!el) return; el.removeAttribute('data-processed'); el.innerHTML = sources[id]; });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    body.classList.toggle('dark', dark);
+    toggleIcon.textContent = dark ? '☀️' : '🌙';
+    toggleLabel.textContent = dark ? 'Light' : 'Dark';
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (localStorage.getItem('theme') === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

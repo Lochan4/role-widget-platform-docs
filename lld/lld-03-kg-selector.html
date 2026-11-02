@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 03 — KG Selector | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html" class="active">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 03 — KG Selector <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 03 — KG Selector</h1>
+  <p class="page-intro">
+    Walks the knowledge graph from an employee's responsibilities to the widgets that serve them, scores each path,
+    and writes the personalised bundle. Every assignment is explainable as a KG path.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Once an employee has a bucket, this builds their personal dashboard — the ordered list of widgets they should see. It walks the knowledge graph along the path: <em>employee performs a responsibility → that responsibility is served by a widget</em>, scoped only to widgets that belong to their bucket. It also adds "bucket-core" widgets — things the majority of bucket members use — even if this specific employee's JD didn't mention them, so everyone gets a complete baseline on day one.</p>
+    <p>Each widget gets a score based on knowledge graph edge weights and feedback signals from usage. Anything scoring above the inclusion threshold makes it into the bundle. A <strong>live / sample tag</strong> is applied to each widget: if the client has mapped their database tables, the widget shows real live data; otherwise it shows sample placeholder data until the mapping is done.</p>
+    <p>The bundle is written to the database atomically (delete + insert in one transaction) and simultaneously cached in Redis for fast dashboard delivery. A distributed lock prevents two concurrent builds for the same person from colliding.</p>
+    <p>After writing, it emits a <code>BundleBuilt</code> event listing any responsibilities that had no matching widget. That list goes straight to the Reuse Ladder (LLD 04) to close the gaps.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> <code>BucketAssigned</code> from LLD 2; widget activation or feedback-weight changes from LLD 9<br/>
+    <strong>Outputs:</strong> <code>user_widget_bundle</code> written; <code>BundleBuilt(user_id, uncovered_responsibilities)</code> → LLD 4; bundle cache → Redis
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["BucketAssigned\n← LLD 2"] --> B["LLD 3\nKG Selector"]
+    C["KG weight changes\n← LLD 9"] --> B
+    B --> D["user_widget_bundle\n(DB)"]
+    B --> E["BundleBuilt\n→ LLD 4"]
+    B --> F["bundle:{user_id}\n→ Redis"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>BucketAssigned</code></td>
+          <td><code>{user_id, bucket_id}</code></td>
+          <td>LLD 2 Bucket Matcher</td>
+          <td>BundleBuildJob (this LLD)</td>
+        </tr>
+        <tr>
+          <td>Widget activation</td>
+          <td><code>{widget_id, bucket_id}</code></td>
+          <td>Admin / LLD 5 Generator</td>
+          <td>BundleBuildJob (this LLD) for all bucket members</td>
+        </tr>
+        <tr>
+          <td>Feedback weight change</td>
+          <td><code>{kg_edge_id, new_weight}</code></td>
+          <td>LLD 9 Feedback Loop</td>
+          <td>BundleBuildJob (this LLD)</td>
+        </tr>
+        <tr>
+          <td><code>BundleBuilt</code></td>
+          <td><code>{user_id, uncovered_responsibilities: string[]}</code></td>
+          <td>BundleBuildJob (this LLD)</td>
+          <td>LLD 4 Reuse Ladder</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">BundleBuildJob(user_id)</div>
+    <p><strong>Responsibility:</strong> Orchestrate the full bundle build pipeline for a single user. Takes a distributed lock before starting to prevent concurrent builds for the same user.</p>
+    <p><strong>Interface:</strong> <code>BundleBuildJob.run(user_id) → void</code></p>
+    <p><strong>Lock:</strong> Acquires <code>lock:bundle-build:{user_id}</code> (Redis NX, TTL=30s with heartbeat) before any work.</p>
+    <p><strong>Idempotency:</strong> Repeated triggers collapse to one active build; lock owner completes the latest state, subsequent triggers find the lock held and exit.</p>
+    <p><strong>Failure handling:</strong> Lock expire mid-job → idempotent writes make re-run safe (delete + insert in transaction).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">KG Traversal</div>
+    <p><strong>Responsibility:</strong> Walk: <code>Employee → PERFORMS → Responsibility → SERVED_BY → Widget</code>, restricted to <code>Bucket -CONTAINS-> Widget</code> for this user's bucket; status=active widgets only.</p>
+    <p><strong>Interface:</strong> <code>traverseKG(user_id, bucket_id) → {paths: KGPath[], uncovered: string[]}</code></p>
+    <p><strong>Reads:</strong> <code>kg_nodes</code>, <code>kg_edges</code>, <code>user_responsibilities</code>, <code>user_bucket_map</code></p>
+    <p><strong>Writes:</strong> None</p>
+    <p><strong>Idempotency:</strong> Read-only traversal.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bucket-Core Widget Adder</div>
+    <p><strong>Responsibility:</strong> Add widgets linked to responsibilities that the majority of bucket members share, even if this specific user's JD didn't mention them. Ensures new members get a full baseline bundle immediately.</p>
+    <p><strong>Interface:</strong> <code>addCoreWidgets(user_id, bucket_id, traversalPaths) → KGPath[]</code></p>
+    <p><strong>Reads:</strong> <code>kg_edges</code> (CONTAINS edges with core_widget flag), <code>user_bucket_map</code></p>
+    <p><strong>Writes:</strong> None (returns augmented path list)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Path Scorer</div>
+    <p><strong>Responsibility:</strong> Score each widget by summing across all paths that lead to it.</p>
+    <p><strong>Formula:</strong> <code>score = Σ(PERFORMS_weight × SERVED_BY_weight) + core_widget_boost − feedback_penalty</code></p>
+    <p><strong>Interface:</strong> <code>scorePaths(paths: KGPath[], feedback: FeedbackMap) → WidgetScore[]</code></p>
+    <p><strong>Reads:</strong> <code>kg_edges.weight</code>, feedback data from LLD 9</p>
+    <p><strong>Writes:</strong> None</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Inclusion Filter</div>
+    <p><strong>Responsibility:</strong> Keep every widget whose score clears <code>WIDGET_INCLUSION_THRESHOLD</code>. No top-N cap — the threshold is the only gate.</p>
+    <p><strong>Interface:</strong> <code>filterWidgets(scores: WidgetScore[]) → WidgetScore[]</code></p>
+    <p><strong>Reads:</strong> Config threshold</p>
+    <p><strong>Writes:</strong> None</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Live/Sample Tagger</div>
+    <p><strong>Responsibility:</strong> For each widget in the filtered set, call <code>fn_live_widgets(tenant_id)</code> to determine whether the widget has live data or will render in sample mode for this tenant.</p>
+    <p><strong>Interface:</strong> <code>tagLiveSample(widgets: WidgetScore[], tenant_id) → TaggedWidget[]</code></p>
+    <p><strong>Reads:</strong> <code>tenant_schema_registry</code> via <code>fn_live_widgets</code></p>
+    <p><strong>Writes:</strong> None</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bundle Writer</div>
+    <p><strong>Responsibility:</strong> Write the final bundle atomically. Delete existing rows for user + insert new rows, store the KG explanation path per widget, refresh Redis cache.</p>
+    <p><strong>Interface:</strong> <code>writeBundle(user_id, widgets: TaggedWidget[], paths: KGPath[]) → void</code></p>
+    <p><strong>Reads:</strong> None</p>
+    <p><strong>Writes:</strong> <code>user_widget_bundle</code> (delete + insert in one transaction), <code>bundle:{user_id}</code> in Redis (SET, TTL=86400s)</p>
+    <p><strong>Idempotency:</strong> Delete + insert inside a transaction; safe to re-run.</p>
+    <p><strong>Failure handling:</strong> DB transaction failure → Redis not updated; stale Redis entry expires within TTL; next build corrects both.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">BundleBuilt Emitter</div>
+    <p><strong>Responsibility:</strong> After bundle write, emit <code>BundleBuilt(user_id, uncovered_responsibilities)</code> to trigger gap analysis in LLD 4.</p>
+    <p><strong>Interface:</strong> <code>emitBundleBuilt(user_id, uncovered: string[]) → void</code></p>
+    <p><strong>Reads:</strong> None</p>
+    <p><strong>Writes:</strong> Event bus / Kafka topic</p>
+    <p><strong>Idempotency:</strong> Duplicate emits safe — LLD 4 deduplicates by responsibility.</p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Trigger as Event trigger
+    participant Lock as Redis Lock
+    participant KGT as KG Traversal
+    participant Core as Core Widget Adder
+    participant Scorer as Path Scorer
+    participant Filter as Inclusion Filter
+    participant Tagger as Live/Sample Tagger
+    participant Writer as Bundle Writer
+    participant Emit as BundleBuilt Emitter
+
+    Trigger->>Lock: SETNX lock:bundle-build:{user_id} (TTL 30s)
+    alt Lock acquired
+        Lock-->>KGT: proceed
+        KGT->>KGT: traverse Employee→Responsibility→Widget (bucket-scoped)
+        KGT->>Core: augment with bucket-core widgets
+        Core->>Scorer: scorePaths(all paths, feedback)
+        Scorer->>Filter: filterWidgets (above threshold)
+        Filter->>Tagger: tagLiveSample(tenant_id)
+        Tagger->>Writer: writeBundle (delete+insert txn)
+        Writer->>Writer: SET bundle:{user_id} in Redis (TTL 86400s)
+        Writer->>Emit: emitBundleBuilt(user_id, uncovered[])
+        Emit-->>Trigger: BundleBuilt → LLD 4
+    else Lock held (concurrent build running)
+        Lock-->>Trigger: skip — build in progress
+    end
+    </div>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>5 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>bundle:{user_id}</code></td>
+          <td>JSON string</td>
+          <td>86400s (24 h)</td>
+          <td>Bundle rebuild (Bundle Writer overwrites); manual invalidation by LLD 4</td>
+        </tr>
+        <tr>
+          <td><code>lock:bundle-build:{user_id}</code></td>
+          <td>String (NX)</td>
+          <td>30s, extended by heartbeat</td>
+          <td>Job completion (DEL) or TTL expiry</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Tables Touched -->
+  <h2>6 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>user_widget_bundle</code></td><td>W (delete + insert in txn)</td><td><a href="../schema.html#user_widget_bundle">schema → user_widget_bundle</a></td></tr>
+        <tr><td><code>kg_nodes</code></td><td>R</td><td><a href="../schema.html#kg_nodes">schema → kg_nodes</a></td></tr>
+        <tr><td><code>kg_edges</code></td><td>R</td><td><a href="../schema.html#kg_edges">schema → kg_edges</a></td></tr>
+        <tr><td><code>tenant_schema_registry</code></td><td>R (via fn_live_widgets)</td><td><a href="../schema.html#tenant_schema_registry">schema → tenant_schema_registry</a></td></tr>
+        <tr><td><code>user_responsibilities</code></td><td>R</td><td><a href="../schema.html#user_responsibilities">schema → user_responsibilities</a></td></tr>
+        <tr><td><code>user_bucket_map</code></td><td>R</td><td><a href="../schema.html#user_bucket_map">schema → user_bucket_map</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>7 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>WIDGET_INCLUSION_THRESHOLD</code></td><td>Minimum path score for a widget to enter the bundle (no top-N cap)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>CORE_WIDGET_BOOST</code></td><td>Score bonus applied to bucket-core widgets</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>FEEDBACK_PENALTY_WEIGHT</code></td><td>Weight applied to negative feedback signals in path scoring</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>BUNDLE_LOCK_HEARTBEAT_INTERVAL_MS</code></td><td>How often the running BundleBuildJob extends the Redis lock TTL</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>8 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-02-bucket-matcher.html">LLD 2 — Bucket Matcher</a></td><td><code>BucketAssigned(user_id, bucket_id)</code></td></tr>
+        <tr><td>In ←</td><td><a href="lld-09-feedback-loop.html">LLD 9 — Feedback Loop</a></td><td>KG edge weight updates → re-trigger bundle rebuild</td></tr>
+        <tr><td>In ←</td><td><a href="lld-08-data-resolver.html">LLD 8 — Data Resolver</a></td><td>live/sample tags via <code>fn_live_widgets</code></td></tr>
+        <tr><td>In ←</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>Permission metadata used to mark widget sensitivity</td></tr>
+        <tr><td>Out →</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td><code>BundleBuilt(user_id, uncovered_responsibilities)</code></td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td><code>bundle:{user_id}</code> written / refreshed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>9 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>User in no bucket (still unbucketed) → write empty bundle + flag "being set up"; show holding card on dashboard.</li>
+      <li>All widgets in sample mode (no live data sources for tenant) → bundle is written with all entries tagged sample; user sees widgets with placeholder data.</li>
+      <li>Lock expired mid-job → bundle delete+insert is transactional; a re-run produces the correct final state. The Redis entry may briefly be stale but expires within TTL.</li>
+      <li>Responsibility with no widgets in any bucket → surfaces in <code>uncovered_responsibilities</code> sent to LLD 4; does not block the bundle write.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>Should <code>WIDGET_INCLUSION_THRESHOLD</code> be global or per-bucket? Per-bucket allows tuning but increases config surface.</li>
+      <li>How should the bundle handle a widget that was in the previous bundle but now scores below threshold? Silent removal or a grace period?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (el) sources[id] = el.textContent.trim(); });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (!el) return; el.removeAttribute('data-processed'); el.innerHTML = sources[id]; });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    body.classList.toggle('dark', dark);
+    toggleIcon.textContent = dark ? '☀️' : '🌙';
+    toggleLabel.textContent = dark ? 'Light' : 'Dark';
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (localStorage.getItem('theme') === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

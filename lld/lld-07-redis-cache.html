@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 07 — Redis Cache | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html" class="active">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 07 — Redis Cache <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <h1>LLD 07 — Redis Cache</h1>
+  <p class="page-intro">
+    Holds each bucket's widgets and question index as the first lookup layer; Postgres is the source of truth behind it.
+    Every key is versioned so invalidation is exact and stale reads cannot happen.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>The speed layer. Everything the serving path touches lives here first — Postgres is the fallback, not the first call. There are nine key families; the important ones:</p>
+    <ul>
+      <li><code>bundle:{user_id}</code> — the employee's ordered widget list. Rebuilt whenever their bucket, access level, or a widget changes.</li>
+      <li><code>bucket:{id}:v</code> + <code>bucket:{id}:{v}:widgets</code> — versioned widget set per bucket. A version bump instantly makes the old set stale; there is no window where a stale read can happen.</li>
+      <li><code>qidx:bucket</code> — a RediSearch HNSW vector index of all questions, tagged by bucket and widget. This is what powers the semantic search in LLD 06.</li>
+      <li><code>wdata:{widget_id}:{tenant_id}:{scope}</code> — cached query results per widget per client. Deleted the moment the source data changes (via Kafka CDC).</li>
+      <li><code>rag:{hash}:{data_v}:{scope}</code> — cached LLM answers. The access scope is part of the key so user A's filtered answer is never served to user B with different permissions.</li>
+      <li><code>wacl:*</code> + <code>uacl:*</code> — widget access metadata and user access profiles. <strong>Pinned — never evicted.</strong> Evicting these would cause wrong access decisions; any eviction triggers an immediate alert.</li>
+    </ul>
+    <p>The eviction policy uses two tiers: data and answer keys use LRU eviction (they can be regenerated). Bucket, index, and access keys are pinned with no eviction policy — these must always be in memory.</p>
+  </div>
+
+  <!-- 1. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> Bucket/widget changes, new tenant onboarding (→ CacheWarmJob); question routing reads; CDC events from Kafka (→ invalidation)<br/>
+    <strong>Outputs:</strong> Cached widgets, question index hits, bundle JSON, widget data, RAG answers to LLD 3, 6, 8
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["LLD 3\nKG Selector\n(bundle build)"] --> B["LLD 7\nRedis Cache"]
+    C["LLD 6\nQuestion Router\n(question read)"] --> B
+    D["Kafka CDC\n(invalidation)"] --> B
+    E["Bucket / widget\nchange events"] --> B
+    B --> F["LLD 3 / 6 / 8\nCache hits"]
+    B --> G["Postgres\n(miss fallback)"]
+    </div>
+  </div>
+
+  <!-- 2. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Bucket membership or widget change</td>
+          <td><code>{bucket_id}</code></td>
+          <td>LLD 2 / 4 / 5</td>
+          <td>CacheWarmJob</td>
+        </tr>
+        <tr>
+          <td>Widget activation</td>
+          <td><code>{widget_id, bucket_ids}</code></td>
+          <td>Admin / LLD 5</td>
+          <td>CacheWarmJob</td>
+        </tr>
+        <tr>
+          <td>New tenant onboarding</td>
+          <td><code>{tenant_id}</code></td>
+          <td>LLD 1</td>
+          <td>CacheWarmJob (warm all active buckets)</td>
+        </tr>
+        <tr>
+          <td>Question routing read</td>
+          <td><code>{query_vector, bucket_id, user_level}</code></td>
+          <td>LLD 6</td>
+          <td>qidx:bucket RediSearch KNN</td>
+        </tr>
+        <tr>
+          <td>CDC event from Kafka</td>
+          <td><code>{table, row_id, tenant_id}</code></td>
+          <td>Debezium → Kafka</td>
+          <td>CacheInvalidationConsumer (LLD 8)</td>
+        </tr>
+        <tr>
+          <td>Bundle build complete</td>
+          <td><code>{user_id}</code></td>
+          <td>LLD 3 BundleBuildJob</td>
+          <td>Bundle writer (this)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">CacheWarmJob(bucket_id)</div>
+    <p><strong>Responsibility:</strong> On bucket change, widget activation, or new tenant onboarding: load the bucket's widgets as a scored set, upsert questions into the RediSearch index, warm the first page of each live widget's data per tenant, and warm predicted next-question widgets per session (drawn from LLD 6 transition graph).</p>
+    <p><strong>Interface:</strong> <code>CacheWarmJob.run(bucket_id, tenant_id?) → void</code></p>
+    <p><strong>Reads:</strong> <code>widgets</code>, <code>questions</code>, <code>widget_data_sources</code>, LLD 6 session transition graph</p>
+    <p><strong>Writes:</strong> <code>bucket:{id}:v</code>, <code>bucket:{id}:{v}:widgets</code>, <code>qidx:bucket</code> upserts, <code>wdata:*</code> first-page warm</p>
+    <p><strong>Concurrency:</strong> Parallelism capped by <code>CACHE_WARM_CONCURRENCY</code>; each bucket warm is idempotent.</p>
+    <p><strong>Failure handling:</strong> Partial warm is acceptable — any miss falls to Postgres via MissTracker; job logs per-bucket success/failure.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">qidx:bucket — RediSearch HNSW Index</div>
+    <p><strong>Responsibility:</strong> Stores all question vectors and text with <code>bucket_id</code> and <code>widget_id</code> tags. KNN search filters on <code>@bucket_id:{id}</code>. Linked widget questions carry every bucket they belong to — linking adds a tag, not a copy of the document.</p>
+    <p><strong>Index fields:</strong> <code>vector VECTOR HNSW</code>, <code>text TEXT</code>, <code>bucket_id TAG</code>, <code>widget_id TAG</code>, <code>min_level NUMERIC</code></p>
+    <p><strong>Used by:</strong> LLD 6 (question routing KNN), LLD 10 (level filtering applied in search query)</p>
+    <p><strong>Invalidation:</strong> Upsert or delete per question; no TTL — pinned key family.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Versioned Key Manager</div>
+    <p><strong>Responsibility:</strong> Every membership or widget change increments <code>bucket:{id}:v</code>. Readers resolve the current version first, then read <code>bucket:{id}:{v}:widgets</code>. Old versioned keys age out by TTL (86400s). Prevents the race where a reader repopulates a key during invalidation.</p>
+    <p><strong>Protocol:</strong> <code>GET bucket:{id}:v → v</code>; <code>ZRANGEBYSCORE bucket:{id}:{v}:widgets …</code>. Writers bump version atomically via <code>INCR bucket:{id}:v</code> before writing new key.</p>
+    <p><strong>Failure handling:</strong> If version key is missing (e.g., after Redis restart), reader treats as miss → Postgres fallback → CacheWarmJob re-queued.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bundle Writer</div>
+    <p><strong>Responsibility:</strong> Writes <code>bundle:{user_id}</code> as JSON after LLD 3 BundleBuildJob completes. Uses delete-then-set pattern (not GETSET) to avoid returning a stale bundle during the brief gap — callers that miss fall back to a synchronous rebuild.</p>
+    <p><strong>Interface:</strong> <code>writeBundle(user_id, payload: BundleJSON) → void</code></p>
+    <p><strong>TTL:</strong> <code>BUNDLE_TTL_SECONDS</code> <span class="tbd">TBD</span></p>
+    <p><strong>Invalidation:</strong> Bundle rebuild triggered by bucket change, access change, widget deprecation, or LLD 11 secondary-bucket assignment.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">LRU Eviction Policy</div>
+    <p><strong>Responsibility:</strong> Data and answer keys (<code>wdata:*</code>, <code>rag:*</code>) live on the LRU eviction tier. Bucket and index keys (<code>bucket:*</code>, <code>qidx:*</code>, <code>wacl:*</code>, <code>uacl:*</code>) are pinned and must not be evicted.</p>
+    <p><strong>Implementation:</strong> Two logical Redis tiers (can be two databases or separate clusters): LRU tier has <code>maxmemory-policy allkeys-lru</code>; pinned tier has <code>maxmemory-policy noeviction</code>. If unified cluster is used, pinned keys must have no TTL and be monitored separately.</p>
+    <p><strong>Alert condition:</strong> Eviction of any key in the pinned family → page immediately.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Miss Tracker</div>
+    <p><strong>Responsibility:</strong> Any cache miss falls back to Postgres, fills the key, and records the miss metric per key family. High miss rate on <code>bucket:*</code> means CacheWarmJob is lagging; high miss rate on <code>wdata:*</code> is expected on cold tenants.</p>
+    <p><strong>Interface:</strong> <code>MissTracker.record(key_family: string, key: string) → void</code></p>
+    <p><strong>Emits:</strong> <code>cache.miss</code> metric tagged by <code>key_family</code>; alert threshold per family is configurable.</p>
+  </div>
+
+  <!-- 4. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+flowchart TD
+    subgraph Write["Write Path — Bundle Build"]
+        W1["BundleBuildJob\n(LLD 3)"] --> W2["Bundle Writer\nbundle:{user_id}"]
+        W3["Bucket / widget\nchange"] --> W4["CacheWarmJob"]
+        W4 --> W5["bucket:{id}:{v}:widgets\n(sorted set)"]
+        W4 --> W6["qidx:bucket\n(RediSearch upsert)"]
+        W4 --> W7["wdata:* first page\n(per tenant warm)"]
+    end
+    subgraph Read["Read Path — Question Routing"]
+        R1["LLD 6\nQuestion Router"] --> R2{"qidx:bucket\nhit?"}
+        R2 -->|"Hit"| R3["Return ranked\nquestion candidates"]
+        R2 -->|"Miss"| R4["Postgres fallback\n+ fill key\n+ MissTracker.record"]
+    end
+    subgraph Data["Read Path — Widget Data"]
+        D1["GET /api/widgets/{id}/data\n(LLD 8)"] --> D2{"wdata:*\nhit?"}
+        D2 -->|"Hit"| D3["Return cached rows"]
+        D2 -->|"Miss"| D4["Run resolved_sql\n(LLD 8) → cache → return"]
+    end
+    </div>
+  </div>
+
+  <!-- 5. State Machine — Versioned Key Lifecycle -->
+  <h2>5 · Versioned Key Lifecycle</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+stateDiagram-v2
+    [*] --> current: CacheWarmJob writes bucket:{id}:{v}:widgets
+    current --> stale: membership change increments bucket:{id}:v
+    stale --> expired: TTL elapses (86400s)
+    expired --> [*]
+    current --> [*]: Redis restart (all keys lost → replay)
+    </div>
+    <p style="margin-top:12px;font-size:0.875rem;color:var(--txt-muted)">Readers always resolve <code>bucket:{id}:v</code> first. A reader that resolves version N and reads <code>bucket:{id}:{N}:widgets</code> is reading a consistent snapshot even if N+1 is being written concurrently.</p>
+  </div>
+
+  <!-- 6. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>Holds</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr><td><code>bucket:{id}:v</code></td><td>string</td><td>Current bucket_version (integer)</td><td>none (pinned)</td><td>Membership or widget change</td></tr>
+        <tr><td><code>bucket:{id}:{v}:widgets</code></td><td>sorted set</td><td>Widget IDs scored by bucket-core weight</td><td>86400s (old version expires naturally)</td><td>Version bump writes new key</td></tr>
+        <tr><td><code>widget:{id}:{wv}</code></td><td>hash</td><td>spec, form, html_path, status, data_sources</td><td>86400s</td><td>Widget version bump</td></tr>
+        <tr><td><code>qidx:bucket</code></td><td>RediSearch index</td><td>Question vectors + text, tagged bucket_id + widget_id + min_level</td><td>none (pinned)</td><td>Upsert / delete per question</td></tr>
+        <tr><td><code>bundle:{user_id}</code></td><td>JSON string</td><td>Ordered widgets, live/sample flags, explanation paths</td><td><code>BUNDLE_TTL_SECONDS</code> <span class="tbd">TBD</span></td><td>Bundle rebuild (access, bucket, widget change)</td></tr>
+        <tr><td><code>wdata:{widget_id}:{tenant_id}:{scope}</code></td><td>JSON string</td><td>Query result rows</td><td>Per refresh class (30s / 3600s / 86400s) <span class="tbd">TBD</span></td><td>CDC table change, TTL</td></tr>
+        <tr><td><code>rag:{hash}:{data_v}</code></td><td>string</td><td>Cached LLM answer</td><td><code>RAG_CACHE_TTL_SECONDS</code> <span class="tbd">TBD</span></td><td>data_version change, TTL</td></tr>
+        <tr><td><code>lock:bundle-build:{user_id}</code></td><td>string NX</td><td>Job lock with heartbeat</td><td>30s + heartbeat renewal</td><td>Job end or expiry</td></tr>
+        <tr><td><code>wacl:{widget_id}:{tenant_id}</code></td><td>hash</td><td>Widget access metadata (min_level, data_scope, etc.)</td><td>86400s (pinned)</td><td>widget_access row change</td></tr>
+        <tr><td><code>uacl:{user_id}</code></td><td>hash</td><td>User access profile (level, department, roles)</td><td>Session / HR sync cadence</td><td>HR sync (LLD 1)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 7. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <p style="color:var(--txt-muted);font-size:0.875rem">LLD 7 owns no Postgres tables. On any cache miss it reads the following tables via the miss fallback path.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><code>widgets</code></td><td>R</td><td>Miss on <code>widget:{id}:{wv}</code> or <code>bucket:{id}:{v}:widgets</code></td></tr>
+        <tr><td><code>questions</code></td><td>R</td><td>Miss on <code>qidx:bucket</code> warm</td></tr>
+        <tr><td><code>user_widget_bundle</code></td><td>R</td><td>Miss on <code>bundle:{user_id}</code></td></tr>
+        <tr><td><code>widget_access</code></td><td>R</td><td>Miss on <code>wacl:{widget_id}:{tenant_id}</code></td></tr>
+        <tr><td><code>user_access_profile</code></td><td>R</td><td>Miss on <code>uacl:{user_id}</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>BUNDLE_TTL_SECONDS</code></td><td>TTL for <code>bundle:{user_id}</code> JSON</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>WIDGET_DATA_TTL_REALTIME_SECONDS</code></td><td>TTL for realtime-refresh-class wdata keys</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>WIDGET_DATA_TTL_HOURLY_SECONDS</code></td><td>TTL for hourly-refresh-class wdata keys</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>WIDGET_DATA_TTL_DAILY_SECONDS</code></td><td>TTL for daily-refresh-class wdata keys</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>RAG_CACHE_TTL_SECONDS</code></td><td>TTL for LLM answer cache entries</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>REDIS_LRU_MAX_MEMORY</code></td><td>Max memory for the LRU eviction tier</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>CACHE_WARM_CONCURRENCY</code></td><td>Max parallel CacheWarmJob threads</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td>BundleBuildJob writes bundle via Bundle Writer; reads <code>bucket:{id}:{v}:widgets</code></td></tr>
+        <tr><td>In ←</td><td><a href="lld-06-question-router.html">LLD 6 — Question Router</a></td><td>KNN reads on <code>qidx:bucket</code>; predicted next-question widgets for warm</td></tr>
+        <tr><td>In ←</td><td><a href="lld-08-data-resolver.html">LLD 8 — Data Resolver</a></td><td>Reads/writes <code>wdata:*</code>; CDC consumer deletes stale keys</td></tr>
+        <tr><td>In ←</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>Reads <code>wacl:*</code> and <code>uacl:*</code> on every access check</td></tr>
+        <tr><td>In ←</td><td><a href="lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></td><td>Secondary-bucket assignment triggers bundle rebuild → Bundle Writer</td></tr>
+        <tr><td>Out →</td><td>Postgres</td><td>Miss fallback reads; source of truth for all key families</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Redis restart — all keys lost; CacheWarmJob replays for all active buckets; RediSearch index is rebuilt from Postgres; reads fall to Postgres during warm-up (expected elevated miss rate).</li>
+      <li>Eviction of a pinned key under extreme memory pressure — must alert immediately; no silent stale reads; operator must either expand memory or reduce LRU tier usage.</li>
+      <li>Bucket with 1000+ widgets — sorted set is fine at that cardinality but bundle delivery to the client needs pagination; the full sorted set is not sent raw to the browser.</li>
+      <li>CacheWarmJob lag on a large tenant with many buckets — warm concurrency capped; newly onboarded tenant sees elevated misses until warm completes; MissTracker alert fires if lag exceeds threshold.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>Single Redis cluster vs. two tiers (LRU + noeviction) — operational complexity trade-off; one cluster is simpler but pinned-key eviction risk is higher under memory pressure.</li>
+      <li>Should <code>rag:*</code> keys include the access scope in the cache key to prevent cross-user answer leakage, or is data_version granularity sufficient? (LLD 10 notes scope in key.)</li>
+      <li>RediSearch index rebuild time on restart for a large corpus — is a warm-standby replica needed to avoid routing downtime?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) sources[id] = el.textContent.trim();
+    });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme','dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme','light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  const saved = localStorage.getItem('theme');
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (saved === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

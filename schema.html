@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Schema Reference — Decision Widget Library</title>
+  <link rel="stylesheet" href="assets/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<!-- ── Sidebar ── -->
+<aside class="sidebar">
+  <div class="sidebar-logo">Decision Widgets</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="index.html">HLD — High-Level Design</a>
+
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a>
+    <a href="lld/lld-02-responsibility-extraction.html">LLD 02 — Responsibility Extraction</a>
+    <a href="lld/lld-03-bucket-assignment.html">LLD 03 — Bucket Assignment</a>
+    <a href="lld/lld-04-kg-builder.html">LLD 04 — KG Builder</a>
+    <a href="lld/lld-05-coverage-gap.html">LLD 05 — Coverage Gap</a>
+    <a href="lld/lld-06-generation.html">LLD 06 — Generation</a>
+    <a href="lld/lld-07-routing.html">LLD 07 — Routing</a>
+    <a href="lld/lld-08-access-control.html">LLD 08 — Access Control</a>
+    <a href="lld/lld-09-widget-serving.html">LLD 09 — Widget Serving</a>
+    <a href="lld/lld-10-feedback.html">LLD 10 — Feedback</a>
+    <a href="lld/lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a>
+
+    <div class="nav-section">Reference</div>
+    <a href="schema.html" class="active">Schema</a>
+  </nav>
+</aside>
+
+<!-- ── Top header ── -->
+<header class="top-header">
+  <div class="header-title">Schema Reference <span>v2 bucket/KG model</span></div>
+  <button id="dark-toggle" onclick="document.body.classList.toggle('dark')">&#9680; Dark</button>
+</header>
+
+<!-- ── Main content ── -->
+<main class="main-content">
+
+  <h1>Schema Reference</h1>
+  <p class="page-intro">
+    Complete table reference for the v2 decision-widget data model.
+    Covers all design-doc tables (existing + new), column-level conflicts with the current
+    <code>schema.sql</code>, and the additive migration plan.
+  </p>
+
+  <!-- ════════════════════════════════════════════
+       § 1  ER DIAGRAM
+  ════════════════════════════════════════════ -->
+  <h2 id="er-diagram">1. ER Diagram</h2>
+  <p>Grouped by domain. Only the most important relationships are shown; FK details are in the table cards below.</p>
+
+  <!-- Tenant & People -->
+  <h3>Tenant &amp; People</h3>
+  <div class="mermaid">
+erDiagram
+  tenants ||--o{ tenant_erp_connections : "has"
+  tenants ||--o{ tenant_onboarding_state : "tracks"
+  tenants ||--o{ tenant_users : "has"
+  tenant_users ||--o{ user_responsibilities : "has"
+  tenants ||--o{ user_responsibilities : "scoped to"
+  </div>
+
+  <!-- Buckets & KG -->
+  <h3>Buckets &amp; KG</h3>
+  <div class="mermaid">
+erDiagram
+  tenants ||--o{ buckets : "owns"
+  responsibilities ||--o{ user_responsibilities : "normalised from"
+  tenant_users ||--o{ user_bucket_map : "mapped via"
+  buckets ||--o{ user_bucket_map : "mapped via"
+  kg_nodes ||--o{ kg_edges : "from"
+  kg_nodes ||--o{ kg_edges : "to"
+  buckets }o--|| kg_nodes : "node"
+  responsibilities }o--|| kg_nodes : "node"
+  </div>
+
+  <!-- Widgets & Questions -->
+  <h3>Widgets &amp; Questions</h3>
+  <div class="mermaid">
+erDiagram
+  widgets ||--o{ widget_questions : "tagged with"
+  questions ||--o{ widget_questions : "tags"
+  questions ||--o{ question_transitions : "from"
+  questions ||--o{ question_transitions : "to"
+  buckets ||--o{ question_transitions : "scoped to"
+  widgets ||--o{ widget_access : "has policy"
+  tenants ||--o{ widget_access : "overrides"
+  </div>
+
+  <!-- Generation -->
+  <h3>Generation</h3>
+  <div class="mermaid">
+erDiagram
+  buckets ||--o{ bucket_coverage_gaps : "has"
+  responsibilities ||--o{ bucket_coverage_gaps : "about"
+  bucket_coverage_gaps ||--o{ generation_queue : "queued as"
+  bucket_coverage_gaps ||--o{ generation_runs : "resolved by"
+  responsibilities ||--o{ generation_runs : "for"
+  </div>
+
+  <!-- Routing & Caching -->
+  <h3>Routing &amp; Caching</h3>
+  <div class="mermaid">
+erDiagram
+  tenant_users ||--o{ question_log : "asks"
+  questions ||--o{ question_log : "matched to"
+  widgets ||--o{ rag_answers : "answered by"
+  tenants ||--o{ tenant_schema_registry : "registers"
+  tenants ||--o{ tenant_widget_queries : "customises"
+  widgets ||--o{ tenant_widget_queries : "customised via"
+  </div>
+
+  <!-- Access Control -->
+  <h3>Access Control</h3>
+  <div class="mermaid">
+erDiagram
+  tenant_users ||--|| user_access_profile : "has"
+  tenants ||--o{ user_access_profile : "scoped to"
+  widgets ||--o{ widget_access : "governed by"
+  tenants ||--o{ access_decisions : "logs"
+  tenant_users ||--o{ access_decisions : "decided for"
+  widgets ||--o{ access_decisions : "subject"
+  </div>
+
+  <!-- Feedback -->
+  <h3>Feedback</h3>
+  <div class="mermaid">
+erDiagram
+  tenants ||--o{ widget_events : "emits"
+  tenant_users ||--o{ widget_events : "actor"
+  widgets ||--o{ widget_events : "subject"
+  tenants ||--o{ user_bucket_affinity : "scoped to"
+  tenant_users ||--o{ user_bucket_affinity : "for"
+  buckets ||--o{ user_bucket_affinity : "about"
+  tenants ||--o{ bucket_assignment_decisions : "scoped to"
+  tenant_users ||--o{ bucket_assignment_decisions : "for"
+  buckets ||--o{ bucket_assignment_decisions : "about"
+  tenant_users ||--o{ user_widget_bundle : "has"
+  tenants ||--o{ user_widget_bundle : "scoped to"
+  </div>
+
+
+  <!-- ════════════════════════════════════════════
+       § 2  TABLE REFERENCE
+  ════════════════════════════════════════════ -->
+  <h2 id="table-reference">2. Table Reference</h2>
+
+  <!-- ─── tenants ─── -->
+  <div class="card" id="tbl-tenants">
+    <h3>tenants</h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>Root entity for every organisation. All tenant-scoped tables carry a <code>tenant_id</code> FK back here.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>UUID</td><td>No</td><td>gen_random_uuid()</td><td>Primary key</td></tr>
+          <tr><td>name</td><td>TEXT</td><td>No</td><td>—</td><td>Organisation display name</td></tr>
+          <tr><td>slug</td><td>TEXT</td><td>No</td><td>—</td><td>URL-safe identifier; unique</td></tr>
+          <tr><td>erp_type</td><td>TEXT</td><td>Yes</td><td>—</td><td>e.g. sap, oracle, netsuite</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> slug &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> all LLDs</p>
+  </div>
+
+  <!-- ─── tenant_erp_connections ─── -->
+  <div class="card" id="tbl-tenant_erp_connections">
+    <h3>tenant_erp_connections</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>Stores credentials and sync state for each tenant's ERP connection. One row per tenant per ERP system.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>UUID</td><td>No</td><td>gen_random_uuid()</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>connector_id</td><td>INT</td><td>No</td><td>—</td><td>FK → erp_connectors</td></tr>
+          <tr><td>credentials</td><td>JSONB</td><td>Yes</td><td>—</td><td>Encrypted credential blob</td></tr>
+          <tr><td>last_synced_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>Timestamp of last successful sync</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>Yes</td><td>'pending'</td><td>connected / error / pending</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, connector_id → erp_connectors &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-01-ingestion.html">LLD 01</a></p>
+  </div>
+
+  <!-- ─── tenant_onboarding_state ─── -->
+  <div class="card" id="tbl-tenant_onboarding_state">
+    <h3>tenant_onboarding_state</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>Tracks the onboarding pipeline stage for each tenant. One row per tenant.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>UUID</td><td>No</td><td>gen_random_uuid()</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants; unique</td></tr>
+          <tr><td>stage</td><td>TEXT</td><td>No</td><td>'connected'</td><td><span class="tbd">CONFLICT</span> design doc: <code>buckets_assigned</code>; schema: <code>schema_mapped</code>. See §3c.</td></tr>
+          <tr><td>meta</td><td>JSONB</td><td>Yes</td><td>'{}'</td><td>Arbitrary stage metadata</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last stage transition time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> tenant_id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-01-ingestion.html">LLD 01</a>, <a href="lld/lld-03-bucket-assignment.html">LLD 03</a></p>
+  </div>
+
+  <!-- ─── tenant_users ─── -->
+  <div class="card" id="tbl-tenant_users">
+    <h3>tenant_users</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>One row per employee synced from the ERP. Source of truth for identity within the system.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>UUID</td><td>No</td><td>gen_random_uuid()</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>external_id</td><td>TEXT</td><td>No</td><td>—</td><td>ERP employee ID</td></tr>
+          <tr><td>name</td><td>TEXT</td><td>Yes</td><td>—</td><td>Display name</td></tr>
+          <tr><td>email</td><td>TEXT</td><td>Yes</td><td>—</td><td>Work email</td></tr>
+          <tr><td>department</td><td>TEXT</td><td>Yes</td><td>—</td><td>Department from ERP</td></tr>
+          <tr><td>title</td><td>TEXT</td><td>Yes</td><td>—</td><td>Job title from ERP</td></tr>
+          <tr><td>manager_id</td><td>TEXT</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> ERP manager reference (ADD COLUMN)</td></tr>
+          <tr><td>jd_hash</td><td>TEXT</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> Hash of last ingested JD blob (ADD COLUMN)</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, external_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-02-responsibility-extraction.html">LLD 02</a>, <a href="lld/lld-03-bucket-assignment.html">LLD 03</a>, <a href="lld/lld-08-access-control.html">LLD 08</a>, <a href="lld/lld-10-feedback.html">LLD 10</a></p>
+  </div>
+
+  <!-- ─── user_responsibilities ─── -->
+  <div class="card" id="tbl-user_responsibilities">
+    <h3>user_responsibilities <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-02-responsibility-extraction.html">LLD 02 — Responsibility Extraction</a></p>
+    <p>Raw responsibility strings extracted from JDs and ERP data for each employee, before global deduplication.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>text</td><td>TEXT</td><td>No</td><td>—</td><td>Raw responsibility text</td></tr>
+          <tr><td>embedding</td><td>vector(3072)</td><td>Yes</td><td>—</td><td>text-embedding-3-large vector</td></tr>
+          <tr><td>responsibility_id</td><td>INT</td><td>Yes</td><td>—</td><td>FK → responsibilities; set after dedup</td></tr>
+          <tr><td>chunk_index</td><td>INT</td><td>Yes</td><td>—</td><td>Position within the source document</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, responsibility_id → responsibilities &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> HNSW on <code>embedding</code> (vector_cosine_ops), B-tree on <code>tenant_id</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-02-responsibility-extraction.html">LLD 02</a>, <a href="lld/lld-03-bucket-assignment.html">LLD 03</a>, <a href="lld/lld-04-kg-builder.html">LLD 04</a></p>
+  </div>
+
+  <!-- ─── responsibilities ─── -->
+  <div class="card" id="tbl-responsibilities">
+    <h3>responsibilities <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-02-responsibility-extraction.html">LLD 02 — Responsibility Extraction</a></p>
+    <p>Global deduplicated canonical responsibilities. Each <code>user_responsibilities</code> row eventually maps here after the dedup pass.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>canonical_text</td><td>TEXT</td><td>No</td><td>—</td><td>Normalised canonical responsibility text</td></tr>
+          <tr><td>embedding</td><td>vector(3072)</td><td>Yes</td><td>—</td><td>Embedding of canonical_text</td></tr>
+          <tr><td>source</td><td>TEXT</td><td>Yes</td><td>'extracted'</td><td>extracted / seeded / admin</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>RLS:</strong> No (global)</p>
+    <p><strong>Indexes:</strong> HNSW on <code>embedding</code> (vector_cosine_ops)</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-03-bucket-assignment.html">LLD 03</a>, <a href="lld/lld-05-coverage-gap.html">LLD 05</a>, <a href="lld/lld-06-generation.html">LLD 06</a></p>
+  </div>
+
+  <!-- ─── buckets ─── -->
+  <div class="card" id="tbl-buckets">
+    <h3>buckets <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-03-bucket-assignment.html">LLD 03 — Bucket Assignment</a></p>
+    <p>Role-like groupings that replace fixed job titles. Each bucket has a profile embedding used for cosine similarity matching against user responsibilities.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>UUID</td><td>No</td><td>gen_random_uuid()</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>name</td><td>TEXT</td><td>No</td><td>—</td><td>Human-readable bucket label</td></tr>
+          <tr><td>profile_embedding</td><td>vector(3072)</td><td>Yes</td><td>—</td><td>Centroid embedding of member responsibilities</td></tr>
+          <tr><td>bucket_version</td><td>INT</td><td>No</td><td>1</td><td>Incremented on each refit</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'draft'</td><td>draft / active / deprecated</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, name) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> HNSW on <code>profile_embedding</code> (vector_cosine_ops), B-tree on <code>tenant_id</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-03-bucket-assignment.html">LLD 03</a>, <a href="lld/lld-04-kg-builder.html">LLD 04</a>, <a href="lld/lld-05-coverage-gap.html">LLD 05</a>, <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── user_bucket_map ─── -->
+  <div class="card" id="tbl-user_bucket_map">
+    <h3>user_bucket_map <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-03-bucket-assignment.html">LLD 03 — Bucket Assignment</a></p>
+    <p>Many-to-many mapping of users to buckets with role (primary/secondary), assignment score, and provenance.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>bucket_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → buckets</td></tr>
+          <tr><td>role</td><td>TEXT</td><td>No</td><td>—</td><td>primary / secondary</td></tr>
+          <tr><td>score</td><td>FLOAT</td><td>Yes</td><td>—</td><td>Cosine similarity score at time of assignment</td></tr>
+          <tr><td>method</td><td>TEXT</td><td>Yes</td><td>—</td><td>auto / provisional / admin / inferred</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'active'</td><td>active / pending_review / expired</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, user_id, bucket_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, bucket_id → buckets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-08-access-control.html">LLD 08</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── kg_nodes ─── -->
+  <div class="card" id="tbl-kg_nodes">
+    <h3>kg_nodes <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global + tenant rows (tenant_id nullable) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-04-kg-builder.html">LLD 04 — KG Builder</a></p>
+    <p>Vertices of the knowledge graph. A null <code>tenant_id</code> denotes a global node (e.g. a canonical responsibility); a non-null value scopes it to one tenant.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>Yes</td><td>—</td><td>FK → tenants; null = global node</td></tr>
+          <tr><td>node_type</td><td>TEXT</td><td>No</td><td>—</td><td>Bucket / Responsibility / Widget / Question / DataSource / Employee</td></tr>
+          <tr><td>external_id</td><td>TEXT</td><td>No</td><td>—</td><td>PK of the referenced entity in its own table</td></tr>
+          <tr><td>props</td><td>JSONB</td><td>No</td><td>'{}'</td><td>Arbitrary node properties</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, node_type, external_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> Yes (by tenant_id)</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-04-kg-builder.html">LLD 04</a>, <a href="lld/lld-07-routing.html">LLD 07</a></p>
+  </div>
+
+  <!-- ─── kg_edges ─── -->
+  <div class="card" id="tbl-kg_edges">
+    <h3>kg_edges <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global + tenant rows (tenant_id nullable) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-04-kg-builder.html">LLD 04 — KG Builder</a></p>
+    <p>Directed edges of the knowledge graph. Edge types include HAS_RESPONSIBILITY, SERVED_BY, CONTAINS, ANSWERS, FOLLOWED_BY, NEEDS, PERFORMS, IN.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>Yes</td><td>—</td><td>FK → tenants; null = global edge</td></tr>
+          <tr><td>from_node</td><td>BIGINT</td><td>No</td><td>—</td><td>FK → kg_nodes</td></tr>
+          <tr><td>to_node</td><td>BIGINT</td><td>No</td><td>—</td><td>FK → kg_nodes</td></tr>
+          <tr><td>edge_type</td><td>TEXT</td><td>No</td><td>—</td><td>Relationship type label</td></tr>
+          <tr><td>weight</td><td>FLOAT</td><td>No</td><td>1.0</td><td>Edge strength</td></tr>
+          <tr><td>props</td><td>JSONB</td><td>No</td><td>'{}'</td><td>Arbitrary edge properties</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, from_node, to_node, edge_type) &nbsp;|&nbsp; <strong>FK:</strong> from_node → kg_nodes, to_node → kg_nodes &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> Composite B-tree on <code>(from_node, edge_type)</code> and <code>(to_node, edge_type)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-04-kg-builder.html">LLD 04</a>, <a href="lld/lld-07-routing.html">LLD 07</a></p>
+  </div>
+
+  <!-- ─── bucket_coverage_gaps ─── -->
+  <div class="card" id="tbl-bucket_coverage_gaps">
+    <h3>bucket_coverage_gaps <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped (tenant_id nullable for global gaps) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-05-coverage-gap.html">LLD 05 — Coverage Gap</a></p>
+    <p>Records where a bucket has no widget covering a given responsibility. Drives the generation queue.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>bucket_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → buckets</td></tr>
+          <tr><td>responsibility_id</td><td>INT</td><td>No</td><td>—</td><td>FK → responsibilities</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>Yes</td><td>—</td><td>FK → tenants; null = cross-tenant gap</td></tr>
+          <tr><td>member_count</td><td>INT</td><td>No</td><td>1</td><td>Number of bucket members affected</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'open'</td><td>open / accumulating / ready / generating / in_review / closed</td></tr>
+          <tr><td>resolved_by</td><td>TEXT</td><td>Yes</td><td>—</td><td>link / fork / generate</td></tr>
+          <tr><td>detected_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>When the gap was first detected</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last status transition time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (bucket_id, responsibility_id) &nbsp;|&nbsp; <strong>FK:</strong> bucket_id → buckets, responsibility_id → responsibilities &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> B-tree on <code>(bucket_id, status)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-05-coverage-gap.html">LLD 05</a>, <a href="lld/lld-06-generation.html">LLD 06</a></p>
+  </div>
+
+  <!-- ─── generation_queue ─── -->
+  <div class="card" id="tbl-generation_queue">
+    <h3>generation_queue <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped (tenant_id nullable) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Priority work queue for the widget generation pipeline. Supports coalescing duplicate gap requests before a run starts.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>gap_id</td><td>BIGINT</td><td>No</td><td>—</td><td>FK → bucket_coverage_gaps</td></tr>
+          <tr><td>priority</td><td>FLOAT</td><td>No</td><td>0.0</td><td>Higher value = processed sooner</td></tr>
+          <tr><td>state</td><td>TEXT</td><td>No</td><td>'waiting'</td><td>waiting / coalescing / running / done / failed</td></tr>
+          <tr><td>coalesce_until</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>Hold until this time to batch duplicates</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>Yes</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last state transition time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> gap_id → bucket_coverage_gaps &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> B-tree on <code>(state, priority DESC)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-06-generation.html">LLD 06</a></p>
+  </div>
+
+  <!-- ─── generation_runs ─── -->
+  <div class="card" id="tbl-generation_runs">
+    <h3>generation_runs <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Audit log of every LLM generation attempt — input intents, raw output, token usage, and final status.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>responsibility_id</td><td>INT</td><td>No</td><td>—</td><td>FK → responsibilities</td></tr>
+          <tr><td>gap_id</td><td>BIGINT</td><td>Yes</td><td>—</td><td>FK → bucket_coverage_gaps (null = manual trigger)</td></tr>
+          <tr><td>intents</td><td>JSONB</td><td>No</td><td>'[]'</td><td>Array of intent strings fed to the LLM</td></tr>
+          <tr><td>output</td><td>JSONB</td><td>No</td><td>'[]'</td><td>Array of generated widget specs</td></tr>
+          <tr><td>tokens_used</td><td>INT</td><td>Yes</td><td>—</td><td>Total tokens consumed</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'running'</td><td>running / completed / failed</td></tr>
+          <tr><td>started_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Run start time</td></tr>
+          <tr><td>completed_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>Run completion time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> responsibility_id → responsibilities, gap_id → bucket_coverage_gaps &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-06-generation.html">LLD 06</a></p>
+  </div>
+
+  <!-- ─── widgets ─── -->
+  <div class="card" id="tbl-widgets">
+    <h3>widgets</h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Master catalogue of all widgets. Each widget is a question-answering unit backed by a data source query. Several columns are added in the v2 migration.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>title</td><td>TEXT</td><td>No</td><td>—</td><td>Display title</td></tr>
+          <tr><td>description</td><td>TEXT</td><td>Yes</td><td>—</td><td>One-line description</td></tr>
+          <tr><td>widget_type</td><td>TEXT</td><td>Yes</td><td>—</td><td>Existing v1 type field (retained)</td></tr>
+          <tr><td>form</td><td>TEXT</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> kpi / trend / comparison / breakdown / alert / forecast / action (ADD COLUMN)</td></tr>
+          <tr><td>parent_widget_id</td><td>INT</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> FK → widgets self-ref for forked widgets (ADD COLUMN)</td></tr>
+          <tr><td>spec_overrides</td><td>JSONB</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> Tenant/bucket spec overrides (ADD COLUMN)</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'active'</td><td><span class="badge">NEW</span> draft / active / deprecated (ADD COLUMN)</td></tr>
+          <tr><td>version</td><td>INT</td><td>No</td><td>1</td><td><span class="badge">NEW</span> Monotonic version counter (ADD COLUMN)</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> parent_widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Indexes:</strong> HNSW on <code>widget_embeddings.embedding</code> (separate table)</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-08-access-control.html">LLD 08</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a>, <a href="lld/lld-10-feedback.html">LLD 10</a></p>
+  </div>
+
+  <!-- ─── questions ─── -->
+  <div class="card" id="tbl-questions">
+    <h3>questions <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Canonical question library. Replaces the v1 <code>cross_questions</code> table. Carries aliases for fuzzy matching and a pgvector embedding for ANN search.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>text</td><td>TEXT</td><td>No</td><td>—</td><td>Canonical question text; unique</td></tr>
+          <tr><td>intent</td><td>TEXT</td><td>Yes</td><td>—</td><td>Classified intent label</td></tr>
+          <tr><td>embedding</td><td>vector(3072)</td><td>Yes</td><td>—</td><td>Dense embedding for ANN retrieval</td></tr>
+          <tr><td>source</td><td>TEXT</td><td>Yes</td><td>'seed'</td><td>seed / promoted / admin</td></tr>
+          <tr><td>aliases</td><td>TEXT[]</td><td>No</td><td>'{}'</td><td>Alternative phrasings for fuzzy matching</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> text &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Indexes:</strong> HNSW on <code>embedding</code> (vector_cosine_ops), GIN pg_trgm on <code>text</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a>, <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── widget_questions ─── -->
+  <div class="card" id="tbl-widget_questions">
+    <h3>widget_questions <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Many-to-many join between widgets and questions with a relevance score. Replaces v1 <code>widget_task_tags</code>.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>question_id</td><td>INT</td><td>No</td><td>—</td><td>FK → questions</td></tr>
+          <tr><td>score</td><td>FLOAT</td><td>No</td><td>1.0</td><td>Relevance score</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> (widget_id, question_id) &nbsp;|&nbsp; <strong>FK:</strong> widget_id → widgets, question_id → questions &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── question_transitions ─── -->
+  <div class="card" id="tbl-question_transitions">
+    <h3>question_transitions <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global (scoped by bucket) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></p>
+    <p>Markov-style transition counts between questions within a bucket. Used to suggest follow-up questions.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>from_question_id</td><td>INT</td><td>No</td><td>—</td><td>FK → questions</td></tr>
+          <tr><td>to_question_id</td><td>INT</td><td>No</td><td>—</td><td>FK → questions</td></tr>
+          <tr><td>bucket_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → buckets</td></tr>
+          <tr><td>count</td><td>INT</td><td>No</td><td>1</td><td>Observed transition count</td></tr>
+          <tr><td>probability</td><td>FLOAT</td><td>No</td><td>0.0</td><td>Normalised probability (recomputed on update)</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last update time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (from_question_id, to_question_id, bucket_id) &nbsp;|&nbsp; <strong>FK:</strong> from_question_id, to_question_id → questions, bucket_id → buckets &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-09-widget-serving.html">LLD 09</a>, <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── question_log ─── -->
+  <div class="card" id="tbl-question_log">
+    <h3>question_log</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-07-routing.html">LLD 07 — Routing</a></p>
+    <p>Append-only log of every question a user asks. Used for routing analytics, feedback, and bucket-learner signals.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>raw_text</td><td>TEXT</td><td>No</td><td>—</td><td>Original question text as typed</td></tr>
+          <tr><td>matched_question_id</td><td>INT</td><td>Yes</td><td>—</td><td><span class="tbd">CONFLICT</span> design doc: FK → <code>questions</code>; schema: FK → <code>cross_questions</code>. See §3c.</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>Yes</td><td>—</td><td>FK → widgets; widget shown in response</td></tr>
+          <tr><td>ts</td><td>TIMESTAMPTZ</td><td>No</td><td>now()</td><td>Event timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, matched_question_id → questions &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── rag_answers ─── -->
+  <div class="card" id="tbl-rag_answers">
+    <h3>rag_answers</h3>
+    <p><strong>Scope:</strong> global (cached responses) &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-07-routing.html">LLD 07 — Routing</a></p>
+    <p>Cache of RAG-generated answers keyed by widget + data version. Invalidated when the underlying data version changes.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>answer</td><td>TEXT</td><td>No</td><td>—</td><td>Generated answer text</td></tr>
+          <tr><td>data_version</td><td>TEXT</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> Data snapshot version string (ADD COLUMN). Replaces v1 role_id FK.</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Cache creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── user_access_profile ─── -->
+  <div class="card" id="tbl-user_access_profile">
+    <h3>user_access_profile <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-08-access-control.html">LLD 08 — Access Control</a></p>
+    <p>Inferred access level, organisational position, and overrides for each user. Rebuilt on ERP sync and confirmed manually when needed.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users; unique per tenant</td></tr>
+          <tr><td>level</td><td>TEXT</td><td>No</td><td>—</td><td>Inferred access level (e.g. IC, manager, director)</td></tr>
+          <tr><td>department</td><td>TEXT</td><td>Yes</td><td>—</td><td>Organisational department</td></tr>
+          <tr><td>region</td><td>TEXT</td><td>Yes</td><td>—</td><td>Geographic region</td></tr>
+          <tr><td>team_ids</td><td>TEXT[]</td><td>No</td><td>'{}'</td><td>ERP team/group identifiers</td></tr>
+          <tr><td>manager_chain</td><td>TEXT[]</td><td>No</td><td>'{}'</td><td>Ordered manager external IDs up to root</td></tr>
+          <tr><td>overrides</td><td>JSONB</td><td>No</td><td>'{}'</td><td>Admin-set access overrides</td></tr>
+          <tr><td>inferred_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>When level was last inferred</td></tr>
+          <tr><td>confirmed_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>When an admin confirmed the level</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, user_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-08-access-control.html">LLD 08</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── widget_access ─── -->
+  <div class="card" id="tbl-widget_access">
+    <h3>widget_access <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> global (null tenant_id) + per-tenant overrides &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-08-access-control.html">LLD 08 — Access Control</a></p>
+    <p>Access policy per widget. A global row (tenant_id IS NULL) provides the default policy; tenant rows override it. Requires PG 15+ UNIQUE NULLS NOT DISTINCT.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>Yes</td><td>—</td><td>FK → tenants; null = global default</td></tr>
+          <tr><td>min_level</td><td>TEXT</td><td>Yes</td><td>—</td><td>Minimum access level required</td></tr>
+          <tr><td>allowed_roles</td><td>TEXT[]</td><td>No</td><td>'{}'</td><td>Whitelisted role labels</td></tr>
+          <tr><td>allowed_departments</td><td>TEXT[]</td><td>No</td><td>'{}'</td><td>Whitelisted department labels</td></tr>
+          <tr><td>data_scope</td><td>TEXT</td><td>No</td><td>'company'</td><td>self / team / department / company — see open question §4</td></tr>
+          <tr><td>sensitivity</td><td>TEXT</td><td>No</td><td>'internal'</td><td>public / internal / confidential / restricted</td></tr>
+          <tr><td>tenant_overrides</td><td>JSONB</td><td>No</td><td>'{}'</td><td>Freeform tenant policy amendments</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (widget_id, tenant_id) NULLS NOT DISTINCT (PG 15+) &nbsp;|&nbsp; <strong>FK:</strong> widget_id → widgets, tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> No (policy table)</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-08-access-control.html">LLD 08</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── access_decisions ─── -->
+  <div class="card" id="tbl-access_decisions">
+    <h3>access_decisions <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-08-access-control.html">LLD 08 — Access Control</a></p>
+    <p>Immutable audit log of every allow/scoped/deny decision. Enables compliance reporting and debugging of access policy.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>decision</td><td>TEXT</td><td>No</td><td>—</td><td>allow / scoped / deny</td></tr>
+          <tr><td>reason</td><td>TEXT</td><td>Yes</td><td>—</td><td>Human-readable explanation</td></tr>
+          <tr><td>ts</td><td>TIMESTAMPTZ</td><td>No</td><td>now()</td><td>Decision timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> B-tree on <code>(tenant_id, user_id, ts)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-08-access-control.html">LLD 08</a></p>
+  </div>
+
+  <!-- ─── tenant_schema_registry ─── -->
+  <div class="card" id="tbl-tenant_schema_registry">
+    <h3>tenant_schema_registry</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>Maps ERP field names to canonical schema fields for each tenant. Enables tenant-specific data extraction without code changes.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>erp_field</td><td>TEXT</td><td>No</td><td>—</td><td>Raw ERP field name</td></tr>
+          <tr><td>canonical_field</td><td>TEXT</td><td>No</td><td>—</td><td>Mapped canonical field name</td></tr>
+          <tr><td>transform</td><td>JSONB</td><td>Yes</td><td>—</td><td>Optional transformation rules</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-01-ingestion.html">LLD 01</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── tenant_widget_queries ─── -->
+  <div class="card" id="tbl-tenant_widget_queries">
+    <h3>tenant_widget_queries</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-09-widget-serving.html">LLD 09 — Widget Serving</a></p>
+    <p>Per-tenant overrides for widget data queries. Allows a tenant to remap a widget's underlying SQL/API call without forking the widget definition.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>query_override</td><td>JSONB</td><td>No</td><td>—</td><td>Replacement query spec</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, widget_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── widget_events ─── -->
+  <div class="card" id="tbl-widget_events">
+    <h3>widget_events <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-10-feedback.html">LLD 10 — Feedback</a></p>
+    <p>Granular interaction events per widget per user. Replaces v1 <code>widget_render_events</code>. Used for feedback scoring and bucket-learner signal generation.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>event</td><td>TEXT</td><td>No</td><td>—</td><td>opened / dwell / thumbs_up / thumbs_down / hide / pin / follow_up</td></tr>
+          <tr><td>value</td><td>FLOAT</td><td>Yes</td><td>—</td><td>Numeric value (e.g. dwell seconds)</td></tr>
+          <tr><td>session_id</td><td>TEXT</td><td>Yes</td><td>—</td><td>Client session identifier</td></tr>
+          <tr><td>ts</td><td>TIMESTAMPTZ</td><td>No</td><td>now()</td><td>Event timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> B-tree on <code>(tenant_id, ts)</code>, B-tree on <code>(user_id, ts)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-10-feedback.html">LLD 10</a>, <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── user_bucket_affinity ─── -->
+  <div class="card" id="tbl-user_bucket_affinity">
+    <h3>user_bucket_affinity <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></p>
+    <p>Aggregated behavioural signal per (user, bucket) pair. Feeds the bucket re-assignment signal when affinity with a non-primary bucket grows.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>bucket_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → buckets</td></tr>
+          <tr><td>score</td><td>FLOAT</td><td>No</td><td>0.0</td><td>Decayed engagement score</td></tr>
+          <tr><td>distinct_questions</td><td>INT</td><td>No</td><td>0</td><td>Unique questions asked related to this bucket</td></tr>
+          <tr><td>distinct_days</td><td>INT</td><td>No</td><td>0</td><td>Distinct days with bucket-related activity</td></tr>
+          <tr><td>last_seen</td><td>TIMESTAMPTZ</td><td>Yes</td><td>—</td><td>Most recent bucket-related event</td></tr>
+          <tr><td>status</td><td>TEXT</td><td>No</td><td>'candidate'</td><td>candidate / inferred_secondary / confirmed / expired</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last recomputation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>Unique:</strong> (tenant_id, user_id, bucket_id) &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, bucket_id → buckets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Indexes:</strong> B-tree on <code>(tenant_id, user_id)</code></p>
+    <p><strong>Read by:</strong> <a href="lld/lld-11-bucket-learner.html">LLD 11</a>, <a href="lld/lld-03-bucket-assignment.html">LLD 03</a></p>
+  </div>
+
+  <!-- ─── bucket_assignment_decisions ─── -->
+  <div class="card" id="tbl-bucket_assignment_decisions">
+    <h3>bucket_assignment_decisions <span class="badge">NEW</span></h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></p>
+    <p>Audit trail of every bucket add/remove/confirm/expire action, recording the evidence that triggered it.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>bucket_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → buckets</td></tr>
+          <tr><td>action</td><td>TEXT</td><td>No</td><td>—</td><td>add / remove / confirm / expire</td></tr>
+          <tr><td>evidence_question_ids</td><td>INT[]</td><td>No</td><td>'{}'</td><td>question IDs that triggered this decision</td></tr>
+          <tr><td>score</td><td>FLOAT</td><td>Yes</td><td>—</td><td>Affinity score at time of decision</td></tr>
+          <tr><td>decided_by</td><td>TEXT</td><td>No</td><td>—</td><td>system / admin / user</td></tr>
+          <tr><td>ts</td><td>TIMESTAMPTZ</td><td>No</td><td>now()</td><td>Decision timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, bucket_id → buckets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-11-bucket-learner.html">LLD 11</a></p>
+  </div>
+
+  <!-- ─── user_widget_bundle ─── -->
+  <div class="card" id="tbl-user_widget_bundle">
+    <h3>user_widget_bundle</h3>
+    <p><strong>Scope:</strong> tenant-scoped &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-09-widget-serving.html">LLD 09 — Widget Serving</a></p>
+    <p>The personalised set of widgets pre-resolved for a user, plus the explanation path for why each was included.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGSERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>tenant_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenants</td></tr>
+          <tr><td>user_id</td><td>UUID</td><td>No</td><td>—</td><td>FK → tenant_users</td></tr>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets</td></tr>
+          <tr><td>path</td><td>JSONB</td><td>Yes</td><td>—</td><td><span class="badge">NEW</span> Explanation path — bucket → responsibility → widget chain (ADD COLUMN)</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Bundle generation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>FK:</strong> tenant_id → tenants, user_id → tenant_users, widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> Yes</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── data_sources ─── -->
+  <div class="card" id="tbl-data_sources">
+    <h3>data_sources</h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a></p>
+    <p>Registry of ERP data sources available for widget queries. Referenced by <code>widget_data_sources</code>.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>SERIAL</td><td>No</td><td>—</td><td>Primary key</td></tr>
+          <tr><td>name</td><td>TEXT</td><td>No</td><td>—</td><td>Source identifier</td></tr>
+          <tr><td>erp_type</td><td>TEXT</td><td>Yes</td><td>—</td><td>sap / oracle / netsuite etc.</td></tr>
+          <tr><td>schema</td><td>JSONB</td><td>Yes</td><td>—</td><td>Field schema definition</td></tr>
+          <tr><td>created_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Row creation time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> id &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-01-ingestion.html">LLD 01</a>, <a href="lld/lld-09-widget-serving.html">LLD 09</a></p>
+  </div>
+
+  <!-- ─── widget_embeddings ─── -->
+  <div class="card" id="tbl-widget_embeddings">
+    <h3>widget_embeddings</h3>
+    <p><strong>Scope:</strong> global &nbsp;|&nbsp; <strong>Owning LLD:</strong> <a href="lld/lld-06-generation.html">LLD 06 — Generation</a></p>
+    <p>Stores the dense embedding for each widget's title + description, used for ANN retrieval during routing.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>widget_id</td><td>INT</td><td>No</td><td>—</td><td>FK → widgets; PK</td></tr>
+          <tr><td>embedding</td><td>vector(3072)</td><td>No</td><td>—</td><td>text-embedding-3-large vector</td></tr>
+          <tr><td>updated_at</td><td>TIMESTAMPTZ</td><td>Yes</td><td>now()</td><td>Last embedding refresh time</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>PK:</strong> widget_id &nbsp;|&nbsp; <strong>FK:</strong> widget_id → widgets &nbsp;|&nbsp; <strong>RLS:</strong> No</p>
+    <p><strong>Indexes:</strong> HNSW on <code>embedding</code> (vector_cosine_ops)</p>
+    <p><strong>Read by:</strong> <a href="lld/lld-07-routing.html">LLD 07</a></p>
+  </div>
+
+
+  <!-- ════════════════════════════════════════════
+       § 3  RECONCILIATION
+  ════════════════════════════════════════════ -->
+  <h2 id="reconciliation">3. Reconciliation</h2>
+
+  <!-- 3a — Missing tables -->
+  <h3 id="reconciliation-missing">3a. Tables in design doc missing from schema.sql</h3>
+  <p>The following 18 tables exist in the design doc but have no corresponding CREATE TABLE in <code>schema.sql</code>. All are created by <code>proposed-migration.sql</code>.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Table</th><th>Category</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="#tbl-responsibilities">responsibilities</a></td><td>Global canonical</td></tr>
+        <tr><td>2</td><td><a href="#tbl-user_responsibilities">user_responsibilities</a></td><td>Tenant extraction</td></tr>
+        <tr><td>3</td><td><a href="#tbl-buckets">buckets</a></td><td>Bucket model</td></tr>
+        <tr><td>4</td><td><a href="#tbl-user_bucket_map">user_bucket_map</a></td><td>Bucket model</td></tr>
+        <tr><td>5</td><td><a href="#tbl-kg_nodes">kg_nodes</a></td><td>Knowledge graph</td></tr>
+        <tr><td>6</td><td><a href="#tbl-kg_edges">kg_edges</a></td><td>Knowledge graph</td></tr>
+        <tr><td>7</td><td><a href="#tbl-bucket_coverage_gaps">bucket_coverage_gaps</a></td><td>Generation</td></tr>
+        <tr><td>8</td><td><a href="#tbl-generation_queue">generation_queue</a></td><td>Generation</td></tr>
+        <tr><td>9</td><td><a href="#tbl-generation_runs">generation_runs</a></td><td>Generation</td></tr>
+        <tr><td>10</td><td><a href="#tbl-questions">questions</a></td><td>Routing</td></tr>
+        <tr><td>11</td><td><a href="#tbl-widget_questions">widget_questions</a></td><td>Routing</td></tr>
+        <tr><td>12</td><td><a href="#tbl-question_transitions">question_transitions</a></td><td>Learner</td></tr>
+        <tr><td>13</td><td><a href="#tbl-widget_events">widget_events</a></td><td>Feedback</td></tr>
+        <tr><td>14</td><td><a href="#tbl-user_access_profile">user_access_profile</a></td><td>Access control</td></tr>
+        <tr><td>15</td><td><a href="#tbl-widget_access">widget_access</a></td><td>Access control</td></tr>
+        <tr><td>16</td><td><a href="#tbl-access_decisions">access_decisions</a></td><td>Access control</td></tr>
+        <tr><td>17</td><td><a href="#tbl-user_bucket_affinity">user_bucket_affinity</a></td><td>Learner</td></tr>
+        <tr><td>18</td><td><a href="#tbl-bucket_assignment_decisions">bucket_assignment_decisions</a></td><td>Learner</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3b — Superseded tables -->
+  <h3 id="reconciliation-superseded">3b. Tables in schema.sql not referenced by design doc</h3>
+  <div class="open-q" style="border-left-color: #94a3b8; background: var(--lld-mini-bg);">
+    <div class="open-q-title" style="color: #94a3b8;">Note</div>
+    <p style="margin:0; font-size: 0.875rem; color: var(--txt);">
+      These 16 tables belong to the <strong>v1 fixed-role design</strong> and are superseded by the bucket/KG model.
+      <strong>Do not drop until migration is confirmed complete.</strong>
+      Keep them in place to allow a side-by-side rollout and rollback path.
+    </p>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Table</th><th>v1 purpose</th><th>v2 replacement</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>functions</td><td>Org function taxonomy</td><td>buckets</td></tr>
+        <tr><td>2</td><td>roles</td><td>Fixed role definitions</td><td>buckets</td></tr>
+        <tr><td>3</td><td>job_descriptions</td><td>Raw JD storage</td><td>user_responsibilities</td></tr>
+        <tr><td>4</td><td>task_domains</td><td>Domain tagging</td><td>kg_nodes (node_type=Responsibility)</td></tr>
+        <tr><td>5</td><td>task_role_tags</td><td>Task–role mapping</td><td>user_bucket_map</td></tr>
+        <tr><td>6</td><td>widget_task_tags</td><td>Widget–task mapping</td><td>widget_questions</td></tr>
+        <tr><td>7</td><td>cross_questions</td><td>Cross-role question bank</td><td>questions</td></tr>
+        <tr><td>8</td><td>role_embeddings</td><td>Role vector store</td><td>buckets.profile_embedding</td></tr>
+        <tr><td>9</td><td>user_jd_embeddings</td><td>Per-user JD vectors</td><td>user_responsibilities.embedding</td></tr>
+        <tr><td>10</td><td>question_embeddings</td><td>Question vectors</td><td>questions.embedding</td></tr>
+        <tr><td>11</td><td>question_log_embeddings</td><td>Log entry vectors</td><td>question_log (inline or removed)</td></tr>
+        <tr><td>12</td><td>user_role_map</td><td>User–role assignment</td><td>user_bucket_map</td></tr>
+        <tr><td>13</td><td>generated_widgets</td><td>LLM output staging</td><td>generation_runs.output + widgets</td></tr>
+        <tr><td>14</td><td>widget_coverage_gaps</td><td>Coverage tracking (v1)</td><td>bucket_coverage_gaps</td></tr>
+        <tr><td>15</td><td>tenant_widget_library</td><td>Tenant widget catalogue</td><td>user_widget_bundle + widget_access</td></tr>
+        <tr><td>16</td><td>widget_render_events</td><td>Render event log</td><td>widget_events</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3c — Column conflicts -->
+  <h3 id="reconciliation-conflicts">3c. Column conflicts</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Column</th><th>schema.sql value</th><th>Design doc value</th><th>Resolution</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>tenant_onboarding_state</td>
+          <td>stage</td>
+          <td><code>'schema_mapped'</code> (enum value)</td>
+          <td><code>'buckets_assigned'</code> (new stage)</td>
+          <td>Add <code>'buckets_assigned'</code> as a valid stage value. Existing rows retain <code>'schema_mapped'</code> until migrated by the bucket-assignment pipeline.</td>
+        </tr>
+        <tr>
+          <td>widgets</td>
+          <td>form, parent_widget_id, spec_overrides, status, version</td>
+          <td>Columns absent</td>
+          <td>New v2 columns required</td>
+          <td>ADD COLUMN IF NOT EXISTS for all five. <code>status</code> defaults to <code>'active'</code>; <code>version</code> defaults to <code>1</code> — safe for existing rows.</td>
+        </tr>
+        <tr>
+          <td>user_widget_bundle</td>
+          <td>path</td>
+          <td>Column absent</td>
+          <td>JSONB explanation path</td>
+          <td>ADD COLUMN IF NOT EXISTS path JSONB. Nullable; populated by v2 bundle builder only.</td>
+        </tr>
+        <tr>
+          <td>rag_answers</td>
+          <td>role_id (schema) / data_version (doc)</td>
+          <td>role_id INT FK roles</td>
+          <td>data_version TEXT</td>
+          <td>ADD COLUMN data_version TEXT. Do NOT drop role_id until v1 RAG paths are retired. Both columns coexist during transition.</td>
+        </tr>
+        <tr>
+          <td>question_log</td>
+          <td>question_id / matched_question_id</td>
+          <td>question_id INT FK cross_questions</td>
+          <td>matched_question_id INT FK questions</td>
+          <td>The migration does not rename the column. New v2 routing writes matched_question_id; v1 code continues to write question_id. Resolve by a data migration once v1 routing is retired.</td>
+        </tr>
+        <tr>
+          <td>tenant_users</td>
+          <td>manager_id, jd_hash</td>
+          <td>Columns absent</td>
+          <td>manager_id TEXT, jd_hash TEXT</td>
+          <td>ADD COLUMN IF NOT EXISTS for both. Nullable; populated by v2 ingestion pipeline.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3d — Proposed change list -->
+  <h3 id="reconciliation-changes">3d. Proposed change list</h3>
+  <p>The following operations are performed by <code>proposed-migration.sql</code>, in order:</p>
+  <ol style="line-height: 2; padding-left: 1.4rem; color: var(--txt);">
+    <li>CREATE TABLE IF NOT EXISTS <strong>responsibilities</strong> (global)</li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>user_responsibilities</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>buckets</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>user_bucket_map</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>kg_nodes</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>kg_edges</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>bucket_coverage_gaps</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>generation_queue</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>generation_runs</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>questions</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>widget_questions</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>question_transitions</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>widget_events</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>user_access_profile</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>widget_access</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>access_decisions</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>user_bucket_affinity</strong></li>
+    <li>CREATE TABLE IF NOT EXISTS <strong>bucket_assignment_decisions</strong></li>
+    <li>ALTER TABLE <strong>tenant_users</strong> ADD COLUMN IF NOT EXISTS manager_id, jd_hash</li>
+    <li>ALTER TABLE <strong>widgets</strong> ADD COLUMN IF NOT EXISTS form, parent_widget_id, spec_overrides, status, version</li>
+    <li>ALTER TABLE <strong>user_widget_bundle</strong> ADD COLUMN IF NOT EXISTS path</li>
+    <li>ALTER TABLE <strong>rag_answers</strong> ADD COLUMN IF NOT EXISTS data_version</li>
+    <li>CREATE all HNSW vector indexes (responsibilities, user_responsibilities, buckets, questions, widget_embeddings)</li>
+    <li>CREATE composite and B-tree indexes on kg_edges, question routing, access audit, and event tables</li>
+    <li>CREATE GIN pg_trgm index on questions(text) for fuzzy search</li>
+  </ol>
+
+
+  <!-- ════════════════════════════════════════════
+       § 4  OPEN QUESTIONS
+  ════════════════════════════════════════════ -->
+  <h2 id="open-questions">4. Open Questions</h2>
+
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>
+        <strong>Blocking vs scoped data (widget_access.data_scope):</strong>
+        It is undecided whether a <code>data_scope = 'self'</code> policy means the widget is entirely hidden for non-managers, or whether it is shown with a scoped view (own-row only). This decision affects how the access engine interprets <code>widget_access.data_scope</code> and what the routing layer returns — a denial or a filtered result set. Pending product decision before LLD 08 is finalised.
+      </li>
+      <li>
+        <strong>First ERP target:</strong>
+        The erp_connectors table has columns for multiple ERP systems, but which connector is implemented first determines which <code>erp_type</code> values are populated in the early schema and which <code>data_sources</code> rows need to exist before the first tenant can onboard. This blocks the LLD 01 connector implementation and should be decided before the ingestion sprint begins.
+      </li>
+    </ul>
+  </div>
+
+</main>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });
+  // keep dark mode toggle in sync with mermaid — simple reload on toggle
+  document.getElementById('dark-toggle').addEventListener('click', function () {
+    const label = document.body.classList.contains('dark') ? '☀ Light' : '☾ Dark';
+    this.textContent = label;
+  });
+</script>
+</body>
+</html>

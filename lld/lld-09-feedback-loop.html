@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 09 — Feedback Loop | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html" class="active">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 09 — Feedback Loop <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <h1>LLD 09 — Feedback Loop</h1>
+  <p class="page-intro">
+    Feeds usage signals back into three places: new questions join widget corpora, KG edge weights shift toward what
+    people actually use, and repeated unanswered questions become coverage gaps for the reuse ladder.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Makes the system smarter over time without any manual curation. Three separate feedback paths run continuously:</p>
+    <ul>
+      <li><strong>Path A — Novel question promotion (incremental).</strong> When an employee asks something that matches no existing question, it is embedded immediately and added to a cluster. The cluster only promotes to a canonical question when enough <em>distinct users</em> have asked similar things — one person's busy afternoon does not trigger it. When promoted, an LLM writes the canonical text, an entity leak check strips any PII or company-specific numbers, and the question joins the global corpus. It is then routed: attach to an existing widget, raise a gap for LLD 04 to link a cross-bucket widget, or raise a gap for LLD 05 to generate a new one.</li>
+      <li><strong>Path B — Widget feedback (nightly batch).</strong> Explicit signals (thumbs up/down, pin, hide) and implicit signals (opened, never opened, dwell time) are logged. Nightly, a batch adjusts knowledge graph edge weights per bucket. A widget consistently hidden in one bucket loses weight for <em>that bucket only</em> — it stays active in others. No interactions for a configurable number of days deprecates the widget and invalidates the cache.</li>
+      <li><strong>Path C — Bucket health (weekly batch).</strong> Checks what percentage of each bucket's responsibilities have a widget. Detects employees whose job descriptions have drifted far enough from their bucket that they should be re-matched. Detects buckets that should be split or merged — but presents both as admin decisions; the system never splits or merges automatically.</li>
+    </ul>
+  </div>
+
+  <!-- 1. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> question_log rows (novel questions from LLD 6); <code>POST /api/feedback</code> (explicit + implicit signals); nightly/weekly batch triggers<br/>
+    <strong>Outputs:</strong> New canonical questions → qidx:bucket (LLD 7); KG edge weight updates (→ LLD 3/4); coverage gaps (→ LLD 4); widget deprecation signals (→ bucket version bump → LLD 7)
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["LLD 6\nquestion_log\n(novel questions)"] --> B["LLD 09\nFeedback Loop"]
+    C["POST /api/feedback\n(explicit + implicit)"] --> B
+    D["Nightly / weekly\nbatch trigger"] --> B
+    B --> E["qidx:bucket\n(LLD 7 — new questions)"]
+    B --> F["kg_edges\n(weight updates)"]
+    B --> G["bucket_coverage_gaps\n(LLD 4)"]
+    B --> H["widget status\n(deprecation → LLD 7)"]
+    </div>
+  </div>
+
+  <!-- 2. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Novel question_log row (no matched_question_id)</td>
+          <td><code>{log_id, user_id, query_text, bucket_id}</code></td>
+          <td>LLD 6 — Question Router</td>
+          <td>Novel question embedder → incremental cluster updater</td>
+        </tr>
+        <tr>
+          <td><code>POST /api/feedback</code></td>
+          <td><code>{user_id, widget_id, signal, value?}</code></td>
+          <td>Client app (explicit) or platform (implicit)</td>
+          <td>Feedback handler → widget_events</td>
+        </tr>
+        <tr>
+          <td>Daily KG weight batch</td>
+          <td><code>{date}</code></td>
+          <td>Scheduler (nightly)</td>
+          <td>Daily KG weight adjuster</td>
+        </tr>
+        <tr>
+          <td>Weekly bucket health batch</td>
+          <td><code>{week}</code></td>
+          <td>Scheduler (weekly)</td>
+          <td>Coverage reporter, drift detector, split/merge suggester</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3. Components — Path A -->
+  <h2>3 · Components</h2>
+
+  <h3>A — Novel Question Promotion (Incremental)</h3>
+
+  <div class="card">
+    <div class="card-title">Novel Question Embedder</div>
+    <p><strong>Responsibility:</strong> Each unmatched <code>question_log</code> row is embedded immediately (not batched) so it is available for cluster assignment without waiting for a nightly job.</p>
+    <p><strong>Interface:</strong> <code>embedNovelQuestion(log_id, query_text) → vector</code></p>
+    <p><strong>Reads:</strong> <code>question_log</code> (unmatched rows)</p>
+    <p><strong>Writes:</strong> embedding stored in-memory cluster buffer; not persisted to Postgres until cluster promotes</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Incremental Cluster Updater</div>
+    <p><strong>Responsibility:</strong> New embedding joins the nearest HDBSCAN cluster as it arrives. A cluster is promoted the moment it crosses the distinct-user threshold — not a raw count. One busy afternoon from one user does not trigger promotion.</p>
+    <p><strong>Threshold check:</strong> <code>distinct_users ≥ NOVEL_QUESTION_CLUSTER_THRESHOLD_DISTINCT_USERS</code> AND similarity above <code>NOVEL_QUESTION_CLUSTER_SIMILARITY_THRESHOLD</code></p>
+    <p><strong>Writes on promotion:</strong> Triggers canonical question writer; records cluster_id for backfill.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Re-Cluster Job (Occasional)</div>
+    <p><strong>Responsibility:</strong> Tidies cluster boundaries when incremental assignments have drifted. Not the primary promotion path — exists only to correct boundary noise. Runs on a schedule independent of promotion events.</p>
+    <p><strong>Effect:</strong> May re-assign existing promoted questions to adjacent clusters; does not depromote already-active questions.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Canonical Question Writer</div>
+    <p><strong>Responsibility:</strong> For each promoted cluster: check against existing questions (cosine similarity above threshold → add as alias, not a new question). If genuinely new: LLM writes canonical question text + intent. Entity leakage check required before writing to global corpus — promoted questions must be reviewed for PII or client-specific values before promotion.</p>
+    <p><strong>Writes:</strong> <code>questions</code> (new canonical or alias), <code>widget_questions</code> (link), <code>question_log.matched_question_id</code> (backfill)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Routing Decision (post-promotion)</div>
+    <p><strong>Responsibility:</strong> Determines where the newly promoted question goes:</p>
+    <ul style="font-size:0.875rem;margin:8px 0 0 20px;color:var(--txt)">
+      <li>Bucket widget answers it → attach via <code>widget_questions</code>.</li>
+      <li>Only a cross-bucket widget answers it → raise gap entry for LLD 4 (link the cross-bucket widget in).</li>
+      <li>Nothing answers it → raise gap entry for LLD 5 (generate a new widget).</li>
+    </ul>
+    <p><strong>Writes:</strong> <code>widget_questions</code> and/or <code>bucket_coverage_gaps</code></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Question Embedder + Index Updater</div>
+    <p><strong>Responsibility:</strong> Embeds the new canonical question, upserts into the Redis question index (<code>qidx:bucket</code> via LLD 7), backfills <code>question_log.matched_question_id</code> for all clustered rows, and adds the question to the session transition graph used by LLD 11.</p>
+    <p><strong>Writes:</strong> <code>qidx:bucket</code> upsert (LLD 7), <code>question_log</code> backfill, transition graph update</p>
+  </div>
+
+  <h3>B — Widget Feedback</h3>
+
+  <div class="card">
+    <div class="card-title">POST /api/feedback Handler</div>
+    <p><strong>Responsibility:</strong> Accepts and logs both explicit signals (thumbs up/down, hide, pin) and implicit signals (opened, dwell_time, follow_up_question, never_opened).</p>
+    <p><strong>Interface:</strong> <code>POST /api/feedback {user_id, widget_id, signal, value?} → 202</code></p>
+    <p><strong>Writes:</strong> <code>widget_events</code> row per signal</p>
+    <p><strong>Idempotency:</strong> Each signal event is a separate append-only row; duplicate submissions from retries are acceptable (aggregation is idempotent).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Daily KG Weight Adjuster</div>
+    <p><strong>Responsibility:</strong> Aggregates <code>widget_events</code> from the past day and converts signals into per-bucket adjustments on <code>SERVED_BY</code> and <code>CONTAINS</code> edge weights in <code>kg_edges</code>.</p>
+    <p><strong>Deprecation logic:</strong> Widget consistently hidden within a specific bucket → weight drifts below inclusion threshold for that bucket only (not globally). Consistently poor signals across all buckets → added to admin review queue. Unused for <code>WIDGET_DEPRECATION_INACTIVITY_DAYS</code> → status flipped to deprecated; bucket version bumped; cache keys invalidated.</p>
+    <p><strong>Writes:</strong> <code>kg_edges</code> (weight updates), <code>widgets.status</code> (deprecation), <code>buckets.version</code> (bump on deprecation)</p>
+  </div>
+
+  <h3>C — Bucket Health (Weekly)</h3>
+
+  <div class="card">
+    <div class="card-title">Coverage Reporter</div>
+    <p><strong>Responsibility:</strong> Computes the share of a bucket's members' tracked responsibilities that are covered by at least one active widget. This is the primary quality metric for a bucket. Results written to <code>bucket_coverage_gaps</code>.</p>
+    <p><strong>Writes:</strong> <code>bucket_coverage_gaps</code> (coverage percentage + gap list)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Drift Detector</div>
+    <p><strong>Responsibility:</strong> Identifies bucket members whose JDs have drifted away from their bucket's profile (embedding distance grown beyond threshold since last assignment). Raises a re-run of LLD 2 (Bucket Matcher) for those users.</p>
+    <p><strong>Writes:</strong> Enqueues <code>BucketMatchJob(user_id)</code> for drifted members</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Split/Merge Suggester</div>
+    <p><strong>Responsibility:</strong> Detects when a bucket contains two clear sub-clusters (suggests split) or when two buckets are near-identical (suggests merge). Both are presented as admin decisions — the system never splits or merges buckets automatically.</p>
+    <p><strong>Writes:</strong> Admin notification with evidence; no schema changes until admin confirms</p>
+  </div>
+
+  <!-- 4. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+flowchart TD
+    subgraph A["A — Novel Question Promotion"]
+        A1["question_log row\n(no match)"] --> A2["Embedder\n(immediate)"]
+        A2 --> A3["Incremental cluster updater"]
+        A3 -->|"threshold crossed"| A4["Canonical question writer\n(LLM + entity check)"]
+        A4 --> A5["Routing decision\n(attach / link gap / generate gap)"]
+        A5 --> A6["qidx:bucket upsert\n+ question_log backfill"]
+        A3 -->|"occasional"| A7["Re-cluster job\n(tidy boundaries)"]
+    end
+    subgraph B["B — Widget Feedback"]
+        B1["POST /api/feedback"] --> B2["widget_events (append)"]
+        B2 --> B3["Daily KG weight adjuster\n(nightly batch)"]
+        B3 --> B4["kg_edges weight update"]
+        B3 -->|"inactivity threshold"| B5["Widget deprecated\n→ bucket version bump\n→ cache invalidation LLD 7"]
+    end
+    subgraph C["C — Bucket Health (weekly)"]
+        C1["Weekly batch"] --> C2["Coverage reporter\n→ bucket_coverage_gaps"]
+        C1 --> C3["Drift detector\n→ BucketMatchJob re-run"]
+        C1 --> C4["Split/merge suggester\n→ admin notification"]
+    end
+    </div>
+  </div>
+
+  <!-- 5. Widget Status State Machine -->
+  <h2>5 · Widget Status State Machine</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+stateDiagram-v2
+    [*] --> draft: widget created (LLD 5)
+    draft --> active: admin approves
+    active --> deprecated: inactivity threshold or poor signals across all buckets
+    deprecated --> active: admin reinstates
+    deprecated --> [*]: soft-delete (future)
+    </div>
+    <p style="margin-top:12px;font-size:0.875rem;color:var(--txt-muted)">Stored in <code>widgets.status</code>. Deprecation bumps all associated <code>buckets.version</code> so bundle and cache keys are invalidated. History is retained — deprecated widgets keep their <code>widget_questions</code> and <code>widget_events</code> rows.</p>
+  </div>
+
+  <!-- 6. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Op</th><th>Reason</th></tr></thead>
+      <tbody>
+        <tr><td><code>qidx:bucket</code></td><td>W (upsert)</td><td>New canonical questions added/updated after promotion</td></tr>
+        <tr><td><code>wdata:*</code></td><td>Invalidated (delete)</td><td>Widget deprecated or deactivated — stale data must not be served</td></tr>
+        <tr><td><code>rag:*</code></td><td>Invalidated (delete)</td><td>Widget deprecated — dependent LLM answers must not be served</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 7. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>widget_events</code></td><td>W (append)</td><td><a href="../schema.html#widget_events">schema → widget_events</a></td></tr>
+        <tr><td><code>question_log</code></td><td>R / W (backfill matched_question_id)</td><td><a href="../schema.html#question_log">schema → question_log</a></td></tr>
+        <tr><td><code>questions</code></td><td>W (new canonicals + aliases)</td><td><a href="../schema.html#questions">schema → questions</a></td></tr>
+        <tr><td><code>widget_questions</code></td><td>W (attach new questions)</td><td><a href="../schema.html#widget_questions">schema → widget_questions</a></td></tr>
+        <tr><td><code>kg_edges</code></td><td>W (weight updates)</td><td><a href="../schema.html#kg_edges">schema → kg_edges</a></td></tr>
+        <tr><td><code>bucket_coverage_gaps</code></td><td>W (new gaps)</td><td><a href="../schema.html#bucket_coverage_gaps">schema → bucket_coverage_gaps</a></td></tr>
+        <tr><td><code>buckets</code></td><td>R / W (version bump on deprecation)</td><td><a href="../schema.html#buckets">schema → buckets</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>NOVEL_QUESTION_CLUSTER_THRESHOLD_DISTINCT_USERS</code></td><td>Min distinct users asking similar questions before cluster promotes</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>NOVEL_QUESTION_CLUSTER_SIMILARITY_THRESHOLD</code></td><td>Cosine similarity threshold for cluster membership and alias detection</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>KG_WEIGHT_DAILY_DECAY_FACTOR</code></td><td>Daily multiplicative decay applied to KG edge weights</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>WIDGET_DEPRECATION_INACTIVITY_DAYS</code></td><td>Days of zero interactions before widget is flagged for deprecation</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>FEEDBACK_INCLUSION_THRESHOLD</code></td><td>Bucket-specific KG weight below which widget is excluded from that bucket's scored set</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>BUCKET_HEALTH_COVERAGE_TARGET</code></td><td>Minimum coverage share a bucket should achieve before generating a gap alert</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-06-question-router.html">LLD 6 — Question Router</a></td><td>Unmatched question_log rows (novel questions)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td>New questions upserted to qidx:bucket; wdata/rag keys invalidated on deprecation</td></tr>
+        <tr><td>Out →</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td>bucket_coverage_gaps raised for linking or generation</td></tr>
+        <tr><td>Out →</td><td><a href="lld-05-generator.html">LLD 5 — Generator</a></td><td>bucket_coverage_gaps raised when no existing widget answers a promoted question</td></tr>
+        <tr><td>Out →</td><td><a href="lld-02-bucket-matcher.html">LLD 2 — Bucket Matcher</a></td><td>BucketMatchJob enqueued for drift-detected members</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Single user gaming promotion via repeated novel questions — distinct-user filter prevents; one user's cluster never crosses threshold alone.</li>
+      <li>Entity leakage in promoted questions (employee names, revenue figures in question text) — canonicalization must strip entities; promotion into the global corpus requires a review step before writing.</li>
+      <li>Fork sprawl: every slightly different phrasing treated as new cluster — similarity threshold must be tuned; alias detection is the primary defence.</li>
+      <li>Question that aliases to multiple existing canonical questions — attach as alias to the closest one; log the ambiguity for admin review.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>What is the right review gate before a promoted question joins the global corpus? (async admin review vs. automated entity-check only)</li>
+      <li>How should the deprecation threshold interact with seasonal widgets (e.g., year-end review widgets inactive for 10 months)?</li>
+      <li>Should implicit signals (dwell time, never opened) carry the same weight as explicit signals (thumbs down) in KG weight adjustment?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) sources[id] = el.textContent.trim();
+    });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme','dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme','light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  const saved = localStorage.getItem('theme');
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (saved === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

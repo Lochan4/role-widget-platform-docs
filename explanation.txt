@@ -1,0 +1,300 @@
+Role Widget Platform — Full Architecture Explanation
+
+What this whole thing is.
+
+The Role Widget Platform connects to a company's HR or ERP system — SAP, Workday, or BambooHR — figures out what each employee actually does based on their job description, and serves them a personalised dashboard of decision widgets on their first day. Widgets are mini data panels that answer the most relevant business questions for that person's role. The platform is multi-tenant — every client's data is isolated, but the library of widget templates is shared across all clients.
+
+The entire architecture documentation is split across thirteen HTML pages: one High-Level Design page, one Schema page, and eleven Low-Level Design pages.
+
+
+THE HIGH-LEVEL DESIGN
+
+This is the ten-thousand-foot view of the whole system.
+
+Five-Layer Architecture.
+
+The system is split into five clean layers.
+
+Layer one is Client Systems. This is the ERP or HRIS that holds employee data. The platform only needs read-only access. Credentials are stored in a secrets manager — never in application code.
+
+Layer two is the Assignment Plane. This is the intelligence layer. It ingests employees, groups them into role buckets, walks the knowledge graph, and decides which widgets each person needs. Six subsystems live here.
+
+Layer three is Generation and Learning. When no existing widget fits a gap, an LLM generator creates one. When users ask questions, a feedback loop learns from that and improves the system over time.
+
+Layer four is Serving. This handles the actual user-facing requests. An employee asks a question, the system routes it to the right widget, fetches live data, and returns a grounded answer.
+
+Layer five is the Stores. PostgreSQL is the source of truth and also holds vector embeddings via pgvector. Redis is the speed layer and also functions as a semantic search index. Kafka handles event streaming from client databases when their underlying data changes.
+
+The layers flow top to bottom: clients connect, employees get bucketed, bundles get built, users get served.
+
+
+The Reuse Ladder — The Core Design Decision.
+
+The most important architectural decision in the entire system is the Reuse Ladder. It is highlighted in yellow in both diagrams on the HLD page. The principle is: the LLM generator is the last resort, not the first.
+
+Before ever calling the AI to create a new widget, the system tries four cheaper options in order.
+
+Rung one: re-weight an existing widget in the same role group. If a widget already exists but its score is just below the inclusion threshold for this responsibility, adjust the knowledge graph edge weight. No new widget created.
+
+Rung two: link a widget from a different role group. If a widget exists in another bucket that semantically matches this responsibility, and the client has the required data, add a link. No new widget created.
+
+Rung three: fork an existing widget with minor changes. If a close match exists but needs different KPIs, different filters, or different data grain, one small LLM call produces a spec override. The fork is a copy-on-write, inheriting the parent's question corpus. One small call, not a full generation run.
+
+Rung four: only if nothing fits, generate a brand-new widget from scratch. This is expensive. The ladder ensures it is reached as rarely as possible.
+
+This design bounds AI costs and prevents the library from filling up with near-duplicate widgets.
+
+
+Three Key Sequences.
+
+The HLD page has three sequence diagrams that tell the full story.
+
+Sequence A shows what happens when a new client connects their ERP. The admin submits credentials. The system syncs all employees, groups them into role buckets, builds a widget bundle for each person, and the first dashboard is live.
+
+Sequence B shows an employee asking a question. The system checks the cache first — that is the fast path. On a miss, it runs a semantic search for matching widgets, checks access, fetches live data from the client's database, the LLM composes an answer, and it is returned to the employee.
+
+Sequence C shows a coverage gap discovered, walked through the reuse ladder, escalated to the generator, put through admin review, approved, and pushed to all affected employees.
+
+
+Architecture Decisions Worth Knowing.
+
+The HLD page documents eight specific decisions with their rationale.
+
+Widget templates are shared, but data is per-tenant. This means zero cross-client data leakage and a single library to maintain.
+
+Buckets are role clusters derived from job description similarity, not fixed job titles. Two employees with identical actual work will share a bundle and a cache entry regardless of what their title says.
+
+The reuse ladder is enforced. The generator only runs after all four rungs are exhausted.
+
+Redis uses HNSW vector indexing for the question semantic search. This delivers sub-twenty millisecond response times on cache hit.
+
+Access is blocked at the whole-widget level by default. A scoped field-level option — where the widget is visible but only filtered rows are shown — exists in the design but the decision to implement it is pending.
+
+Knowledge graph weights are updated nightly in batch, not per question. This prevents write amplification while keeping the graph fresh within twenty-four hours.
+
+Two open questions remain unresolved. First, which ERP system to integrate first — this shapes the connector interface design. Second, whether to implement field-level data scoping or keep whole-widget blocking as the only option.
+
+
+THE SCHEMA
+
+The schema page is the database blueprint. It has entity-relationship diagrams split by domain, then a full table-by-table reference.
+
+Five core entity groups.
+
+Tenants and ERP connections. One row per client company. Stores credentials and sync status. Every other table links back to this via a tenant ID.
+
+Tenant users. One row per employee. Synced from the ERP. Contains job title, department, manager reference, and a hash of their job description. The hash means nightly sync only re-processes employees whose JD actually changed.
+
+User responsibilities. Each employee's job description broken into chunks, with each chunk embedded as a 3072-dimensional vector. This is the raw input to bucket matching.
+
+Responsibilities. A global deduplicated table. Similar chunks from different companies map to the same canonical entry. This is how the platform builds shared knowledge across all clients without sharing any client data.
+
+Buckets. Role groups. Not fixed job titles — dynamically created clusters based on job description similarity. Each client's bucket set is private to them.
+
+The Knowledge Graph.
+
+Knowledge graph nodes hold every bucket, responsibility, and widget as a node in a graph. Knowledge graph edges are the relationships: this bucket contains this widget, this responsibility is served by this widget. Edges are weighted — heavier weight means stronger relevance.
+
+Widget machinery.
+
+The widgets table is the template library. Each row contains a SQL query template, a spec, a form type — KPI, trend, comparison, breakdown, alert, forecast, or action — and a status of draft, active, or deprecated.
+
+The questions table holds canonical questions that map to widgets. This corpus grows over time as users ask questions.
+
+Widget questions links which questions belong to which widget.
+
+Generation queue and generation runs track the pipeline for creating new widgets, with full audit trail from gap to approval.
+
+Serving and access.
+
+User widget bundle is the personalised ordered list of widgets for each employee.
+
+Widget access is per-widget sensitivity metadata — what minimum access level is required, and what data scope restrictions apply.
+
+User access profile is each employee's inferred access level, derived from their JD and org chart position.
+
+Access decisions is an append-only log of every allow or deny decision. This is the compliance audit trail.
+
+Learning tables.
+
+Widget events logs every interaction — opened, thumbs up, hidden, dwell time.
+
+User bucket affinity tracks evidence scores showing whether an employee is drifting toward a secondary role group.
+
+Question log records every question asked, matched or unmatched.
+
+Question transitions records which question typically follows which, used for pre-loading and follow-up suggestions.
+
+
+THE LOW-LEVEL DESIGNS
+
+LLD Zero One — Ingestion.
+
+What it does: connects to a client's ERP and syncs all employees into the system.
+
+Three triggers exist. Admin connects a new client, which triggers a full sync. A nightly cron runs a delta sync and only re-processes employees whose job description hash changed. Webhooks from the ERP fire on new hire, role change, or job description edit.
+
+The People Ingestion Worker paginates through the ERP employee API. For each person it runs the JD Normalizer, which extracts responsibility chunks from the job description — falling back to a title and department template if no JD exists — embeds them as vectors, and stores them.
+
+In parallel, the Schema Discovery Worker reads the client's database structure and suggests which of their actual table names map to the generic aliases the platform's SQL query templates use.
+
+At the end, it fans out a Bucket Match Job for every employee whose JD hash changed.
+
+Key detail: the system is idempotent. Re-running the same sync produces the same result. A bad ERP connection only blocks that step, not the whole pipeline.
+
+
+LLD Zero Two — Bucket Matcher.
+
+What it does: takes an employee's embedded profile vector and assigns them to the right role group.
+
+It builds a composite vector from the employee's title, department, and all responsibility chunks. Then runs an approximate nearest-neighbour search against all existing bucket profiles. The scoring formula combines vector similarity, responsibility overlap, and title keyword match.
+
+Three outcomes based on confidence. High confidence means automatically assigned, no review needed. Medium confidence means provisionally assigned and queued for admin review. Low or no match means added to the unbucketed pool.
+
+When enough unbucketed employees accumulate, the New Bucket Job runs a clustering algorithm on their vectors, creates a new draft bucket per cluster, and has an LLM name each cluster from its members' job titles. Even single-person clusters get their own bucket.
+
+There is also secondary bucket assignment. If an employee scores above a lower threshold on a second bucket, they are silently tagged as secondary. This becomes important later for question routing.
+
+
+LLD Zero Three — KG Selector.
+
+What it does: once an employee has a bucket, this builds their personalised widget bundle by walking the knowledge graph.
+
+The traversal path is: employee performs a responsibility, that responsibility is served by a widget, scoped to widgets in their bucket. Core widgets — things the majority of the bucket uses — are also added even if this specific employee's JD didn't mention them. This ensures everyone gets a baseline bundle on day one.
+
+Each widget path gets a score based on knowledge graph edge weights plus feedback signals. Anything above an inclusion threshold goes into the bundle. A live or sample tag is applied: if the client has mapped their database tables, the widget shows live data; otherwise it shows sample data.
+
+The bundle is written to Postgres atomically and simultaneously cached in Redis with a 24-hour expiry. A distributed lock prevents concurrent builds for the same user.
+
+After writing, it emits a Bundle Built event with a list of responsibilities that had no matching widgets. This goes to the Reuse Ladder.
+
+
+LLD Zero Four — Reuse Ladder.
+
+What it does: closes coverage gaps in the cheapest possible way before calling the generator.
+
+When a responsibility has no widget, it accumulates in a gap. A gap only activates when enough bucket members are affected, or an admin forces it. Once active, it climbs the four rungs described earlier.
+
+Rung one re-weights an existing widget in the same bucket. Rung two links a widget from a different bucket. Rung three forks an existing widget with one small LLM call. Rung four escalates to the generator.
+
+Each successful close triggers a bundle rebuild for all bucket members and a Redis version bump.
+
+In practice, most gaps close at rung two or three. Rung four is reached rarely.
+
+
+LLD Zero Five — Generator.
+
+What it does: when the reuse ladder exhausts all options, it creates a new family of widgets.
+
+A seven-step pipeline runs.
+
+Step one: one LLM call decomposes the responsibility text into a list of decision intents.
+
+Step two: each intent is mapped to one or more widget forms from the fixed catalogue of seven types.
+
+Step three: pre-deduplication. An approximate nearest-neighbour search checks each intent-form pair against the existing library. If a close enough match exists, it is routed back to rung two — link, do not generate. Only truly novel pairs proceed.
+
+Step four: one batched LLM call with few-shot examples produces full specifications for all unmatched pairs. Each specification includes a SQL query template and seed questions.
+
+Step five: validation. JSON schema check, verify SQL templates only use known generic table aliases, reject near-duplicates within the batch.
+
+Step six: feasibility check. Which clients have the required data sources mapped? Those without show the widget in sample mode.
+
+Step seven: review queue. The entire widget family is pushed to the admin for approval. On approval, widgets are written to the library, knowledge graph edges are created, questions are embedded and indexed, and a cache warm job is triggered.
+
+There is a token budget per client per day and a global daily budget. This prevents runaway AI costs. The system also coalesces the same responsibility from multiple clients within a time window so one generation run produces widgets shared across all of them.
+
+
+LLD Zero Six — Question Router.
+
+What it does: the employee-facing intelligence layer. Takes a natural language question and returns an answer using live widget data.
+
+On cache miss, the flow is: normalise and hash the question, check the Redis semantic question index for matches in the employee's bucket filtered by access level, apply a session boost if they just asked a related question, and if nothing clears the threshold, widen to secondary buckets and then the global library.
+
+A global library hit is logged as a gap signal — this responsibility probably needs a widget in this bucket — and sent to the Reuse Ladder.
+
+Access is checked again before any data is passed to the LLM. The LLM composes a grounded answer from widget data and matched questions. The answer is cached in Redis and logged.
+
+The next-question predictor suggests follow-ups from the session transition graph and pre-warms those widgets' data so the next question is even faster.
+
+Every unanswered question is flagged as novel and sent to the Feedback Loop for cluster analysis.
+
+
+LLD Zero Seven — Redis Cache.
+
+What it does: the speed layer. Everything the serving path touches lives here first.
+
+Nine key families exist. The most important ones.
+
+Bundle per user holds the ordered widget list. Rebuilt when bucket, access, or widget changes.
+
+Bucket versioned widgets holds the set of widget IDs per bucket. A version bump makes the old set immediately stale with no race conditions.
+
+The question index is a RediSearch HNSW vector index of all questions, tagged by bucket and widget. This is the semantic search layer.
+
+Widget data cache holds query results per widget per client. Invalidated by change-data-capture events from Kafka when source data changes.
+
+Cached LLM answers are keyed by question hash plus data version plus access scope. The access scope in the key prevents user A's filtered answer being served to user B who has different data access.
+
+The eviction policy is two logical tiers. Data and answer keys use least-recently-used eviction — they can be regenerated if evicted. Bucket, question index, and access keys are pinned — evicting those would cause incorrect serving behaviour, so any eviction of a pinned key triggers an alert.
+
+
+LLD Zero Eight — Data Resolver.
+
+What it does: translates widget SQL templates into tenant-specific live queries and serves widget data.
+
+Widget SQL templates use generic table aliases like placeholder HR employees. This layer takes the admin's confirmed mapping of that alias to their actual table name and renders real SQL.
+
+Before any query ever runs against a client's database, it runs EXPLAIN on their read-only replica. This validates column names and table existence without executing anything. Only after EXPLAIN passes is the query marked verified and the widget flips from sample to live.
+
+Live queries run against the client's read-only replica under a per-tenant credential scoped only to their mapped tables. Results are cached in Redis by refresh class — realtime, hourly, or daily.
+
+When the client's underlying data changes via Kafka change-data-capture, the corresponding cache keys are deleted immediately. Bulk loads are debounced to avoid thousands of individual invalidations.
+
+Security invariant worth stating explicitly: SQL comes only from reviewed templates. LLM output from generation is never executed as SQL at request time. This is a hard invariant.
+
+
+LLD Zero Nine — Feedback Loop.
+
+What it does: makes the system smarter over time. Three distinct feedback paths.
+
+Path A is Novel Question Promotion. When an employee asks something that does not match any existing question, it is embedded immediately. A cluster accumulates similar questions from multiple users. The cluster only promotes to a canonical question when enough distinct users have asked similar things — one person having a busy afternoon does not trigger it. When promoted, an LLM writes the canonical question text, an entity leak check strips any PII or company-specific numbers, and the question joins the corpus. Then it is routed: if a widget answers it, attached; if only a cross-bucket widget answers, gap raised for the Reuse Ladder; if nothing answers it, gap raised for the Generator.
+
+Path B is Widget Feedback, a nightly batch. Explicit signals — thumbs up, thumbs down, pin, hide — and implicit signals — opened, never opened, dwell time — are logged. Nightly, a batch adjusts knowledge graph edge weights per bucket. A widget consistently hidden in one bucket loses weight for that bucket only — it stays active elsewhere. Consistent poor signals globally queues it for admin review. No interactions for a configurable number of days deprecates the widget and invalidates the cache.
+
+Path C is Bucket Health, a weekly batch. The coverage reporter checks what percentage of each bucket's tracked responsibilities have at least one active widget. The drift detector finds employees whose JDs have changed enough that they may now fit a different bucket and re-queues them for matching. The split-merge suggester detects when a bucket has two clear sub-populations or when two buckets have become near-identical. Both are admin decisions — the system only surfaces the evidence.
+
+
+LLD Ten — Access Guard.
+
+What it does: the security enforcement layer. Every path that can surface a widget or its data runs through one function.
+
+Four check points: bundle build, question routing, widget data API, and before data is passed to the LLM. A denial at any point is consistent and logged.
+
+The function returns one of three outcomes. Allow means the user's access level meets the widget's minimum and their department matches. Scoped means allowed, but data is filtered — for example, can see the widget but only their team's rows, not the whole company. The scope is injected as a mandatory SQL predicate in the Data Resolver — never in the UI, where it could be bypassed. Deny means everything else. A widget with no access metadata defaults to deny.
+
+Key design principle: buckets never grant access. Having a secondary bucket does not expand what data you can see. Your level and department are the only things that matter.
+
+Access levels are inferred from job description, title, grade, and org chart at HR sync time. If inference confidence is below a threshold, confidential and restricted widgets require admin confirmation before access is granted.
+
+Every deny is logged to an append-only table for compliance audits. Repeated denials on the same widget surface a request-access flow to the client admin.
+
+
+LLD Eleven — Bucket Learner.
+
+What it does: automatically detects when an employee's actual work has outgrown their primary role group and adds a secondary bucket.
+
+Every time an employee's question is answered by a widget from a bucket other than their primary, a signal is recorded. An affinity scorer maintains a time-decaying score per user and bucket pair — recent behaviour counts more. The score only triggers a secondary bucket assignment when it crosses a threshold AND at least a minimum number of distinct questions AND at least a minimum number of distinct days have contributed. A single busy afternoon does not decide anything.
+
+The assignment lifecycle has six states: candidate, inferred secondary, confirmed, expired, and admin blocked as a circuit breaker. Hysteresis prevents flickering — the removal threshold is intentionally lower than the add threshold, so an assigned secondary bucket will not be immediately removed if signals temporarily drop.
+
+When the same secondary bucket is being inferred for many members of one primary bucket, that is a structural gap. The Reuse Ladder is notified so the most-used widgets from the secondary can be linked directly into the primary.
+
+Every status change triggers a bundle rebuild. The dashboard automatically shows a new section with the secondary bucket's relevant widgets and explains why it appeared.
+
+
+Summary of the whole system.
+
+The platform does five things in sequence. First, it connects to your client's HR system and reads every employee. Second, it groups employees into role clusters based on what they actually do, not their job title. Third, it figures out which widgets each cluster needs, reusing as many existing widgets as possible before generating new ones. Fourth, it serves employees a personalised dashboard and answers their questions with live data from their company's database. Fifth, it continuously improves — learning from questions asked, feedback given, and role drift observed — without ever requiring manual curation.
+
+The fundamental design bets are: role similarity is more useful than job titles, widget reuse is always cheaper than generation, and every access decision must be provable in an audit log.

@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 04 — Reuse Ladder | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html" class="active">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 04 — Reuse Ladder <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 04 — Reuse Ladder</h1>
+  <p class="page-intro">
+    Closes coverage gaps by linking or forking existing widgets before ever calling the generator.
+    Generation is the last rung, not the first.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>When a responsibility has no widget, it becomes a gap. Gaps accumulate silently until enough bucket members are affected (or an admin forces it). Once a gap is active, this component tries to close it as cheaply as possible by climbing four rungs in order — the AI generator is only called on the fourth rung:</p>
+    <ol>
+      <li><strong>Re-weight</strong> — is there already a widget in this bucket that could serve this responsibility if we lower the scoring threshold slightly? If yes, adjust the knowledge graph edge weight. Zero new code, zero cost.</li>
+      <li><strong>Cross-bucket link</strong> — is there a widget in a <em>different</em> bucket that semantically matches and whose data requirements the client has already mapped? If yes, add a link edge. No new widget created.</li>
+      <li><strong>Fork / adapt</strong> — is there a close match that just needs different KPIs, filters, or data grain? One small LLM call produces a spec override. The fork inherits the parent's question corpus and is copy-on-write.</li>
+      <li><strong>Generate</strong> — nothing fits. Write the gap to the generation queue for LLD 05. This is the expensive path.</li>
+    </ol>
+    <p>Each successful close triggers a bundle rebuild for every member of the affected bucket and a Redis version bump. <strong>In practice most gaps close at rung 2 or 3.</strong> Rung 4 is deliberately hard to reach — the ladder is the system's primary cost-control mechanism.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> <code>BundleBuilt(uncovered_responsibilities)</code> from LLD 3; new secondary bucket from LLD 11; global-hit gaps from LLD 6<br/>
+    <strong>Outputs:</strong> New KG edges → triggers bundle rebuild in LLD 3; gaps that exhaust all rungs → <code>generation_queue</code> → LLD 5
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["BundleBuilt\n← LLD 3"] --> B["LLD 4\nReuse Ladder"]
+    C["Secondary bucket\n← LLD 11"] --> B
+    D["Global-hit gaps\n← LLD 6"] --> B
+    B --> E["KG edges\n→ rebuild LLD 3"]
+    B --> F["generation_queue\n→ LLD 5"]
+    B --> G["bucket:{id}:v\n→ Redis LLD 7"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>BundleBuilt</code></td>
+          <td><code>{user_id, uncovered_responsibilities[]}</code></td>
+          <td>LLD 3 KG Selector</td>
+          <td>Gap Aggregator (this LLD)</td>
+        </tr>
+        <tr>
+          <td>New inferred secondary bucket</td>
+          <td><code>{user_id, bucket_id}</code></td>
+          <td>LLD 11 Bucket Learner</td>
+          <td>Gap Aggregator (this LLD)</td>
+        </tr>
+        <tr>
+          <td>Global-hit gap signal</td>
+          <td><code>{responsibility_id, widget_id_matched, bucket_id}</code></td>
+          <td>LLD 6 Question Router</td>
+          <td>Gap Aggregator (this LLD)</td>
+        </tr>
+        <tr>
+          <td>KG edge written (gap closed)</td>
+          <td><code>{bucket_id, edge_type, widget_id}</code></td>
+          <td>KG Edge Writer (this LLD)</td>
+          <td>LLD 3 BundleBuildJob (all bucket members), LLD 7 Redis Cache</td>
+        </tr>
+        <tr>
+          <td>Gap reaches generation_queue</td>
+          <td><code>{gap_id, responsibility_id, bucket_id, priority}</code></td>
+          <td>Rung 4 (this LLD)</td>
+          <td>LLD 5 Generator</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Gap Aggregator</div>
+    <p><strong>Responsibility:</strong> Collect uncovered responsibilities per bucket. A gap activates when <code>member_count ≥ GAP_ACT_MEMBER_THRESHOLD</code> or admin-flagged. Personal gaps (single-user unusual task) → personal widget link, no bucket change.</p>
+    <p><strong>Interface:</strong> <code>aggregateGap(responsibility_id, bucket_id, user_id) → GapRecord</code></p>
+    <p><strong>Reads:</strong> <code>bucket_coverage_gaps</code>, <code>user_bucket_map</code></p>
+    <p><strong>Writes:</strong> <code>bucket_coverage_gaps</code> (upsert, increment member_count)</p>
+    <p><strong>Idempotency:</strong> Upsert on (responsibility_id, bucket_id); safe to call multiple times for the same user.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Rung 1 — In-Bucket Re-weight</div>
+    <p><strong>Responsibility:</strong> Check KG for widgets already in this bucket that could serve the responsibility at a lower inclusion threshold. If found, re-weight the SERVED_BY edge rather than adding anything new.</p>
+    <p><strong>Interface:</strong> <code>tryReweight(responsibility_id, bucket_id) → {hit: bool, edge_id?: string}</code></p>
+    <p><strong>Reads:</strong> Redis <code>bucket:{id}:v</code> (version lookup); <code>kg_edges</code></p>
+    <p><strong>Writes:</strong> <code>kg_edges.weight</code> (update on hit)</p>
+    <p><strong>Failure handling:</strong> No hit → pass to Rung 2.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Rung 2 — Cross-Bucket Link</div>
+    <p><strong>Responsibility:</strong> ANN search over all active widget embeddings and their question corpora. Matching criteria: embedding or question vector close to responsibility vector, data requirements mappable for this tenant, no negative rating from similar buckets. On match: insert <code>Bucket -CONTAINS-> Widget</code> edge with <code>mode=linked</code>.</p>
+    <p><strong>Interface:</strong> <code>tryLink(responsibility_id, bucket_id, tenant_id) → {hit: bool, widget_id?: string}</code></p>
+    <p><strong>Reads:</strong> pgvector ANN on widget embeddings + question embeddings; <code>tenant_schema_registry</code> for mapping check; <code>widget_access</code> for negative rating check</p>
+    <p><strong>Writes:</strong> <code>kg_edges</code> (CONTAINS, mode=linked) on hit</p>
+    <p><strong>Failure handling:</strong> No hit → pass to Rung 3.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Rung 3 — Fork / Adapt</div>
+    <p><strong>Responsibility:</strong> Close match exists but needs different KPIs, filters, grain, or threshold. One small LLM call to produce spec overrides. Result: copy-on-write fork with <code>parent_widget_id</code> + <code>spec_overrides</code>. Fork inherits parent question corpus by reference. Parent spec change flags fork for review.</p>
+    <p><strong>Interface:</strong> <code>tryFork(responsibility_id, candidate_widget_id, bucket_id) → {hit: bool, fork_widget_id?: string}</code></p>
+    <p><strong>Reads:</strong> Parent widget spec; responsibility description</p>
+    <p><strong>Writes:</strong> <code>widgets</code> (fork row), <code>kg_edges</code> (CONTAINS for fork, parent_widget_id back-reference)</p>
+    <p><strong>Failure handling:</strong> LLM call failure → retry once; if still failing, escalate to Rung 4 (generate).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Rung 4 — Generate</div>
+    <p><strong>Responsibility:</strong> No usable match found on any rung. Write the gap to <code>generation_queue</code> for LLD 5.</p>
+    <p><strong>Interface:</strong> <code>escalateToGeneration(gap_id) → void</code></p>
+    <p><strong>Writes:</strong> <code>generation_queue</code> (insert with priority score)</p>
+    <p><strong>Idempotency:</strong> Upsert on <code>gap_id</code>; duplicate escalations are no-ops.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">KG Edge Writer</div>
+    <p><strong>Responsibility:</strong> Insert CONTAINS + SERVED_BY edges for linked or forked widgets; bump <code>bucket_version</code>; invalidate <code>bucket:{id}:*</code> in Redis; enqueue <code>BundleBuildJob</code> for all bucket members.</p>
+    <p><strong>Interface:</strong> <code>writeKGEdges(bucket_id, widget_id, edge_type, mode) → void</code></p>
+    <p><strong>Reads:</strong> None</p>
+    <p><strong>Writes:</strong> <code>kg_edges</code>, <code>buckets.version</code>, Redis <code>bucket:{id}:v</code> (INCR), Redis <code>bucket:{id}:{v}:widgets</code> (invalidate), job queue (BundleBuildJob per member)</p>
+    <p><strong>Idempotency:</strong> Upsert on (bucket_id, widget_id, edge_type).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Gap Closer</div>
+    <p><strong>Responsibility:</strong> After any rung succeeds, mark the gap as resolved with the method used.</p>
+    <p><strong>Interface:</strong> <code>closeGap(gap_id, resolved_by: 'link'|'fork'|'generate') → void</code></p>
+    <p><strong>Writes:</strong> <code>bucket_coverage_gaps.resolved_by</code>, <code>bucket_coverage_gaps.status = closed</code></p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+flowchart TD
+    A["BundleBuilt\n(uncovered_responsibilities[])"] --> B[Gap Aggregator]
+    B --> C{member_count\n≥ threshold\nor admin-flagged?}
+    C -- No --> Z[Wait / accumulate]
+    C -- Yes --> R1[Rung 1\nIn-bucket re-weight]
+    R1 -- Hit --> W[KG Edge Writer\n+ Gap Closer]
+    R1 -- Miss --> R2[Rung 2\nCross-bucket ANN link]
+    R2 -- Hit --> W
+    R2 -- Miss --> R3[Rung 3\nFork / Adapt\none LLM call]
+    R3 -- Hit --> W
+    R3 -- Miss --> R4[Rung 4\nEscalate → generation_queue]
+    R4 --> W2[Gap Closer\nresolved_by=generate]
+    W --> RB[BundleBuildJob\nfor all bucket members]
+    W --> RD[Redis invalidate\nbucket version bump]
+    </div>
+  </div>
+
+  <!-- 6. State Machine — Gap Lifecycle -->
+  <h2>5 · State Machine — Gap Lifecycle</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+stateDiagram-v2
+    [*] --> open : uncovered_responsibility received
+    open --> accumulating : member_count below threshold
+    accumulating --> ready : threshold reached or admin-flagged
+    ready --> generating : escalated to Rung 4 (generation_queue)
+    ready --> closed : closed by Rung 1/2/3 (link or fork)
+    generating --> in_review : LLD 5 produces widget specs
+    in_review --> closed : admin approves
+    in_review --> generating : admin rejects, re-generate
+    </div>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>bucket:{id}:v</code></td>
+          <td>String (integer version counter)</td>
+          <td>No TTL</td>
+          <td>INCR by KG Edge Writer on any gap close; also written by LLD 2</td>
+        </tr>
+        <tr>
+          <td><code>bucket:{id}:{v}:widgets</code></td>
+          <td>Sorted set (widget_id → score)</td>
+          <td>No TTL (versioned; old versions become stale)</td>
+          <td>New version written by KG Edge Writer; old version keys orphaned until eviction</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>bucket_coverage_gaps</code></td><td>W (upsert, update status)</td><td><a href="../schema.html#bucket_coverage_gaps">schema → bucket_coverage_gaps</a></td></tr>
+        <tr><td><code>kg_edges</code></td><td>W (insert CONTAINS / SERVED_BY; update weight)</td><td><a href="../schema.html#kg_edges">schema → kg_edges</a></td></tr>
+        <tr><td><code>widgets</code></td><td>W (fork insert on Rung 3)</td><td><a href="../schema.html#widgets">schema → widgets</a></td></tr>
+        <tr><td><code>generation_queue</code></td><td>W (upsert on Rung 4)</td><td><a href="../schema.html#generation_queue">schema → generation_queue</a></td></tr>
+        <tr><td><code>user_widget_bundle</code></td><td>Indirect — triggers rebuild via BundleBuildJob</td><td><a href="../schema.html#user_widget_bundle">schema → user_widget_bundle</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>COVERAGE_THRESHOLD</code></td><td>Minimum score for a widget to be considered covering a responsibility (Rung 1 lower threshold vs bundle inclusion threshold)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>GAP_ACT_MEMBER_THRESHOLD</code></td><td>Number of bucket members affected before a gap activates (below this: accumulate only)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>CROSS_BUCKET_SIMILARITY_THRESHOLD</code></td><td>Minimum ANN similarity for Rung 2 to consider a widget a cross-bucket link candidate</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>FORK_TRIGGER_SIMILARITY_RANGE</code></td><td>Similarity band that triggers Rung 3: close but not close enough to link as-is</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td><code>BundleBuilt(user_id, uncovered_responsibilities[])</code></td></tr>
+        <tr><td>In ←</td><td><a href="lld-06-question-router.html">LLD 6 — Question Router</a></td><td>Global-hit gap candidates</td></tr>
+        <tr><td>In ←</td><td><a href="lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a></td><td>New inferred secondary bucket assignments</td></tr>
+        <tr><td>Out →</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td>BundleBuildJob enqueued for all bucket members after edge write</td></tr>
+        <tr><td>Out →</td><td><a href="lld-05-generator.html">LLD 5 — Generator</a></td><td>Gap written to <code>generation_queue</code> (Rung 4)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td>Bucket version increment; sorted-set invalidation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Personal gap (single user, unusual task) → bypass bucket accumulation; create a personal widget link directly without changing bucket state.</li>
+      <li>Rung 3 fork produces a widget nearly identical to existing library entry → validator in LLD 5 pre-dedupe step will catch near-duplicates if the fork is later regenerated; Rung 3 should re-check ANN before committing fork.</li>
+      <li>Bucket version races: two concurrent Rung 2 writes for the same bucket → both upsert on (bucket_id, widget_id, edge_type); last writer wins, bucket version is correct.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>Fork sprawl risk — forks should require a real spec difference; need a process to detect and merge forks back when the difference disappears (e.g., parent spec update narrows the gap).</li>
+      <li>When a gap is closed by Rung 2 (cross-bucket link), should the linked widget appear on the bucket dashboard immediately, or only after the next bundle rebuild cycle?</li>
+      <li>Should personal gaps (single user) ever escalate to bucket-level gaps if the same personal task appears for multiple unrelated users over time?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (el) sources[id] = el.textContent.trim(); });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (!el) return; el.removeAttribute('data-processed'); el.innerHTML = sources[id]; });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    body.classList.toggle('dark', dark);
+    toggleIcon.textContent = dark ? '☀️' : '🌙';
+    toggleLabel.textContent = dark ? 'Light' : 'Dark';
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (localStorage.getItem('theme') === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 05 — Generator | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html" class="active">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 05 — Generator <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 05 — Generator</h1>
+  <p class="page-intro">
+    When a gap falls through the reuse ladder, one generator run produces the entire family of widgets needed for that responsibility,
+    each deduplicated against the library. Generation is the last rung, not the first.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>When the Reuse Ladder exhausts all four rungs, this creates new widgets from scratch. One generation run produces an entire family — all the widgets a responsibility needs — in a seven-step pipeline:</p>
+    <ol>
+      <li><strong>Decompose</strong> — one LLM call turns the responsibility text into a list of decision intents (e.g. "track headcount vs plan", "spot attrition risk").</li>
+      <li><strong>Map to forms</strong> — each intent is mapped to one or more of the seven fixed widget forms: KPI, trend, comparison, breakdown, alert, forecast, action.</li>
+      <li><strong>Pre-dedupe</strong> — before generating anything, a semantic search checks each intent-form pair against the existing widget library. Close matches go back to rung 2 (link). Only genuinely novel pairs proceed.</li>
+      <li><strong>Batch spec generation</strong> — one batched LLM call (with examples of well-rated widgets of the same form type as few-shot guidance) produces full specs, including SQL query templates and seed questions.</li>
+      <li><strong>Validate</strong> — schema check, verify SQL templates only use known generic table aliases, reject near-duplicates within the batch.</li>
+      <li><strong>Feasibility</strong> — check which clients have the required data sources mapped. Clients without the data see sample mode; the widget is still created.</li>
+      <li><strong>Review queue</strong> — the entire widget family goes to an admin for approval. On approval: widgets written to the library, knowledge graph edges created, questions embedded and indexed, cache warmed.</li>
+    </ol>
+    <p>There is a <strong>token budget per client per day and a global daily budget</strong> — the system never generates beyond these limits. The same responsibility triggered from multiple clients within a time window is coalesced into one generation run, so the cost and output are shared.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Input:</strong> Gap in <code>generation_queue</code> at state 'ready' from LLD 4<br/>
+    <strong>Outputs:</strong> Approved widgets → KG edges → <code>CacheWarmJob</code> → LLD 7; seed questions → LLD 6; widget metadata → LLD 10
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["generation_queue ready\n← LLD 4"] --> B["LLD 5\nGenerator"]
+    B --> C["widgets + KG edges\n(on approval)"]
+    B --> D["seed questions\n→ LLD 6"]
+    B --> E["CacheWarmJob\n→ LLD 7"]
+    B --> F["widget metadata\n→ LLD 10"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Gap reaches 'ready' state</td>
+          <td><code>{gap_id, responsibility_id, bucket_id, priority_score}</code></td>
+          <td>LLD 4 Rung 4 / Gap Lifecycle Manager</td>
+          <td>Priority Queue Worker (this LLD)</td>
+        </tr>
+        <tr>
+          <td>Empty bucket at onboarding</td>
+          <td><code>{bucket_id, tenant_id}</code></td>
+          <td>LLD 2 NewBucketJob</td>
+          <td>Gap Lifecycle Manager (jumps queue)</td>
+        </tr>
+        <tr>
+          <td>Admin generation request</td>
+          <td><code>{gap_id}</code></td>
+          <td>Admin UI</td>
+          <td>Gap Lifecycle Manager (jumps queue)</td>
+        </tr>
+        <tr>
+          <td>Admin approves widget family</td>
+          <td><code>{generation_run_id, approved_widget_ids[]}</code></td>
+          <td>Admin UI / Review Queue</td>
+          <td>Review Queue Publisher → KG edge write + CacheWarmJob</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Gap Lifecycle Manager</div>
+    <p><strong>Responsibility:</strong> Manage the gap state machine (open → accumulating → ready → generating → in_review → closed). Coalesce the same responsibility across buckets/tenants within the coalescing window before starting a job. Re-run the reuse ladder before starting (library may have changed since the gap was queued).</p>
+    <p><strong>Interface:</strong> <code>GapLifecycleManager.advance(gap_id) → void</code></p>
+    <p><strong>Reads:</strong> <code>generation_queue</code>, <code>bucket_coverage_gaps</code></p>
+    <p><strong>Writes:</strong> <code>generation_queue.status</code>, <code>bucket_coverage_gaps.status</code></p>
+    <p><strong>Idempotency:</strong> State transitions are guarded; advancing an already-advanced gap is a no-op.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Priority Queue Worker</div>
+    <p><strong>Responsibility:</strong> Pull ready gaps from <code>generation_queue</code> ordered by priority score (employees affected × question frequency × recency × bucket-empty flag). Budget-aware: checks per-tenant daily token budget and global daily token budget before starting a run.</p>
+    <p><strong>Interface:</strong> <code>PriorityQueueWorker.poll() → GenerationJob | null</code></p>
+    <p><strong>Reads:</strong> <code>generation_queue</code>, token budget counters (Redis or DB)</p>
+    <p><strong>Writes:</strong> <code>generation_queue.status = generating</code></p>
+    <p><strong>Failure handling:</strong> Budget exhausted → job stays in ready state until next budget window. Worker crash mid-job → gap reverts to ready (heartbeat + timeout).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Responsibility Lock</div>
+    <p><strong>Responsibility:</strong> One generation per responsibility canonical ID at a time. Prevents duplicate runs for the same responsibility triggered from different buckets during the coalescing window.</p>
+    <p><strong>Interface:</strong> <code>acquireLock(responsibility_canonical_id) → bool</code></p>
+    <p><strong>Writes:</strong> Redis SETNX <code>genlock:{responsibility_canonical_id}</code> (TTL = <code>GENERATION_LOCK_TTL_SECONDS</code>)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 1 — Decompose Responsibility</div>
+    <p><strong>Responsibility:</strong> One LLM call: responsibility text + bucket name + sample JD lines → list of decision intents.</p>
+    <p><strong>Interface:</strong> <code>decomposeResponsibility(responsibility_text, bucket_name, jd_samples[]) → Intent[]</code></p>
+    <p><strong>Writes:</strong> <code>generation_runs</code> (step 1 output)</p>
+    <p><strong>Failure handling:</strong> LLM failure → retry with backoff; after max retries, gap reverts to ready.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 2 — Map Intents to Widget Forms</div>
+    <p><strong>Responsibility:</strong> Map each intent to one or more widget forms from the fixed catalogue: kpi, trend, comparison, breakdown, alert, forecast, action. One intent → multiple forms permitted.</p>
+    <p><strong>Interface:</strong> <code>mapToForms(intents: Intent[]) → IntentFormPair[]</code></p>
+    <p><strong>Writes:</strong> <code>generation_runs</code> (step 2 output)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 3 — Pre-Dedupe</div>
+    <p><strong>Responsibility:</strong> Embed a one-line description for each (intent, form) pair; ANN against the widget library. Close match → back to LLD 4 Rung 2 (link); only unmatched pairs proceed to generation.</p>
+    <p><strong>Interface:</strong> <code>preDedupeFilter(pairs: IntentFormPair[]) → {proceed: IntentFormPair[], linked: IntentFormPair[]}</code></p>
+    <p><strong>Reads:</strong> pgvector ANN on widget embeddings</p>
+    <p><strong>Writes:</strong> None (links handled by LLD 4 Rung 2 callback)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 4 — Batch Spec Generation</div>
+    <p><strong>Responsibility:</strong> One batched LLM call (few-shot with well-rated widgets of the same forms) to produce full specs for all unmatched pairs.</p>
+    <p><strong>Output per widget:</strong> <code>{title, description, purpose, form, spec, data_query_template, data_requirements[], responsibility_ids[], intent, seed_questions[]}</code></p>
+    <p><strong>Interface:</strong> <code>batchGenerate(pairs: IntentFormPair[], fewShotExamples[]) → WidgetDraft[]</code></p>
+    <p><strong>Writes:</strong> <code>generation_runs</code> (step 4 output — raw LLM response)</p>
+    <p><strong>Cost controls:</strong> One decomposition call + one batched spec call per responsibility. Results cached by responsibility canonical embedding — retry or similar gap reuses the output.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 5 — Validator</div>
+    <p><strong>Responsibility:</strong> JSON schema check; <code>data_query_template</code> must parse and use only known generic aliases; reject near-duplicates within the batch.</p>
+    <p><strong>Interface:</strong> <code>validateDrafts(drafts: WidgetDraft[]) → {valid: WidgetDraft[], rejected: WidgetDraft[]}</code></p>
+    <p><strong>Reads:</strong> <code>tenant_schema_registry</code> generic aliases</p>
+    <p><strong>Failure handling:</strong> Rejected widgets are logged; the valid portion of the batch continues. If all rejected, gap reverts to ready for re-generation.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 6 — Feasibility Checker</div>
+    <p><strong>Responsibility:</strong> For each valid widget, determine which tenants have <code>data_requirements</code> mapped: available / partial / unavailable. Unavailable widgets are still stored — they surface in sample mode for tenants without the data.</p>
+    <p><strong>Interface:</strong> <code>checkFeasibility(drafts: WidgetDraft[], tenant_id) → FeasibilityTaggedDraft[]</code></p>
+    <p><strong>Reads:</strong> <code>tenant_schema_registry</code></p>
+    <p><strong>Writes:</strong> Feasibility tag on each draft (not persisted until approval)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 7 — Review Queue Publisher</div>
+    <p><strong>Responsibility:</strong> Group widgets as a family; push to review queue for admin approval. On approval: insert into <code>widgets</code>, write KG edges, embed widget + questions, enqueue <code>CacheWarmJob(bucket_id)</code>. While in review: affected employees see closest linked widgets in sample mode, or "being set up" card.</p>
+    <p><strong>Interface:</strong> <code>publishToReviewQueue(family: FeasibilityTaggedDraft[], generation_run_id) → void</code></p>
+    <p><strong>Reads:</strong> None</p>
+    <p><strong>Writes:</strong> Review queue record; on approval: <code>widgets</code>, <code>widget_questions</code>, <code>widget_access</code>, <code>kg_edges</code>, <code>CacheWarmJob</code> enqueue, <code>generation_queue.status = closed</code></p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Q as generation_queue
+    participant GLM as Gap Lifecycle Manager
+    participant PQW as Priority Queue Worker
+    participant Lock as Responsibility Lock
+    participant S1 as Step 1: Decompose
+    participant S2 as Step 2: Map Forms
+    participant S3 as Step 3: Pre-Dedupe
+    participant S4 as Step 4: Batch Gen
+    participant S5 as Step 5: Validate
+    participant S6 as Step 6: Feasibility
+    participant RQ as Review Queue
+    participant Admin
+
+    Q->>GLM: gap status = ready
+    GLM->>GLM: coalesce window check
+    GLM->>GLM: re-run reuse ladder (library may have changed)
+    GLM->>PQW: dispatch if still unresolved
+    PQW->>PQW: check token budgets
+    PQW->>Lock: SETNX genlock:{responsibility_id}
+    Lock-->>S1: acquired
+    S1->>S1: LLM decompose → intents[]
+    S1->>S2: intents[]
+    S2->>S2: map to widget forms
+    S2->>S3: IntentFormPairs[]
+    S3->>S3: ANN pre-dedupe vs library
+    S3->>S4: unmatched pairs only
+    S4->>S4: batched LLM spec generation
+    S4->>S5: WidgetDrafts[]
+    S5->>S5: schema check + alias validation + near-dupe check
+    S5->>S6: valid drafts
+    S6->>S6: feasibility per tenant
+    S6->>RQ: push family for review
+    RQ-->>Admin: notify
+    Admin->>RQ: approve
+    RQ->>RQ: insert widgets, KG edges, embed
+    RQ->>Q: CacheWarmJob(bucket_id)
+    RQ->>GLM: gap status = closed
+    </div>
+  </div>
+
+  <!-- 6. State Machines -->
+  <h2>5 · State Machines</h2>
+
+  <h3>Gap Lifecycle</h3>
+  <div class="state-machine">
+    <div class="mermaid" id="sm-gap">
+stateDiagram-v2
+    [*] --> open : gap created by LLD 4 Rung 4
+    open --> accumulating : evidence below threshold
+    accumulating --> ready : threshold reached / admin-flagged / empty bucket
+    ready --> generating : picked by Priority Queue Worker
+    generating --> in_review : specs published to review queue
+    in_review --> closed : admin approves
+    in_review --> generating : admin rejects → re-generate
+    closed --> [*]
+    </div>
+  </div>
+
+  <h3>Widget Status</h3>
+  <div class="state-machine">
+    <div class="mermaid" id="sm-widget">
+stateDiagram-v2
+    [*] --> draft : created by generator (pending review)
+    draft --> active : admin approves
+    active --> deprecated : superseded, bucket merged, or manual deprecation
+    deprecated --> [*]
+    </div>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <p style="color:var(--txt-muted);font-size:0.875rem">LLD 5 does not own Redis keys directly. On approval it enqueues <code>CacheWarmJob(bucket_id)</code> which writes <code>bucket:{id}:{v}:widgets</code> via LLD 7. The responsibility lock uses Redis transiently.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>genlock:{responsibility_canonical_id}</code></td>
+          <td>String (NX)</td>
+          <td><code>GENERATION_LOCK_TTL_SECONDS</code> <span class="tbd">TBD</span></td>
+          <td>Job completion (DEL) or TTL expiry</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>generation_queue</code></td><td>R/W (status progression)</td><td><a href="../schema.html#generation_queue">schema → generation_queue</a></td></tr>
+        <tr><td><code>generation_runs</code></td><td>W (step outputs)</td><td><a href="../schema.html#generation_runs">schema → generation_runs</a></td></tr>
+        <tr><td><code>widgets</code></td><td>W (on approval)</td><td><a href="../schema.html#widgets">schema → widgets</a></td></tr>
+        <tr><td><code>widget_questions</code></td><td>W (seed questions on approval)</td><td><a href="../schema.html#widget_questions">schema → widget_questions</a></td></tr>
+        <tr><td><code>widget_access</code></td><td>W (proposed sensitivity on approval)</td><td><a href="../schema.html#widget_access">schema → widget_access</a></td></tr>
+        <tr><td><code>bucket_coverage_gaps</code></td><td>W (status update)</td><td><a href="../schema.html#bucket_coverage_gaps">schema → bucket_coverage_gaps</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>GENERATION_COALESCE_WINDOW_MINUTES</code></td><td>Window during which same-responsibility gaps from different buckets/tenants are merged before a job starts</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>GENERATION_EVIDENCE_THRESHOLD_USERS</code></td><td>Distinct employees affected before a gap becomes ready</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>GENERATION_EVIDENCE_THRESHOLD_QUESTIONS</code></td><td>Question frequency count before a gap becomes ready</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>PER_TENANT_DAILY_TOKEN_BUDGET</code></td><td>Max LLM tokens consumed per tenant per day across all generation runs</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>GLOBAL_DAILY_TOKEN_BUDGET</code></td><td>Max LLM tokens across all tenants per day</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>PRE_DEDUPE_SIMILARITY_THRESHOLD</code></td><td>ANN cosine threshold above which a Step 3 candidate is treated as an existing library match (route to link, not generate)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>GENERATION_LOCK_TTL_SECONDS</code></td><td>TTL for the per-responsibility generation lock in Redis</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td>Gap written to <code>generation_queue</code> (Rung 4 escalation)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td>New approved widgets trigger bundle rebuild for bucket members</td></tr>
+        <tr><td>Out →</td><td><a href="lld-06-question-router.html">LLD 6 — Question Router</a></td><td>Seed questions written to <code>widget_questions</code>; indexed by LLD 7</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td><code>CacheWarmJob(bucket_id)</code> enqueued on approval</td></tr>
+        <tr><td>Out →</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>Widget sensitivity metadata written to <code>widget_access</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Step 3 pre-dedupe routes most pairs back to LLD 4 Rung 2 — generator may produce zero new widgets for a run; gap is closed with resolved_by=link, not generate.</li>
+      <li>All generated drafts fail Step 5 validation → entire batch rejected; gap reverts to ready; failure logged for LLM prompt tuning.</li>
+      <li>Token budget exhausted mid-batch → completed drafts saved; remaining pairs requeued for next budget window.</li>
+      <li>Admin rejects entire widget family → gap returns to generating; re-generation uses a different few-shot example set to avoid repeating the same output.</li>
+      <li>Same responsibility reaches ready simultaneously from two tenants during the coalescing window → coalesced into a single generation run; resulting widgets are feasibility-tagged per tenant.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>How many few-shot examples should Step 4 use, and how should they be selected (highest-rated of same form, or most semantically similar responsibility)?</li>
+      <li>Should generation results (Step 4 output) be cached by responsibility canonical embedding? If so, for how long — the library could change and make the cached output stale.</li>
+      <li>Is one admin approval per widget family the right granularity, or should individual widgets within a family be approvable independently?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm-gap','sm-widget'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (el) sources[id] = el.textContent.trim(); });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (!el) return; el.removeAttribute('data-processed'); el.innerHTML = sources[id]; });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    body.classList.toggle('dark', dark);
+    toggleIcon.textContent = dark ? '☀️' : '🌙';
+    toggleLabel.textContent = dark ? 'Light' : 'Dark';
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (localStorage.getItem('theme') === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

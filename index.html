@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD — Role Widget Platform Architecture</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<!-- ── Sidebar ── -->
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="index.html" class="active">HLD</a>
+    <a href="schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld/lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld/lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld/lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld/lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld/lld-05-generator.html">05 — Generator</a>
+    <a href="lld/lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld/lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld/lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld/lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld/lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld/lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<!-- ── Header ── -->
+<header class="top-header">
+  <div class="header-title">
+    Role Widget Platform
+    <span>/ High-Level Design</span>
+  </div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<!-- ── Main ── -->
+<main class="main-content">
+
+  <h1>High-Level Design</h1>
+  <p class="page-intro">Architecture overview — layer model, cross-dependencies, end-to-end sequences, decisions, and open questions.</p>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 1. System Overview                      -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>1 · System Overview</h2>
+  <div class="card">
+    <p>
+      The Role Widget Platform connects to each client's HR and business databases, normalises every employee
+      into a role cluster (bucket), and serves them a personalised dashboard of decision widgets on day one.
+      Widgets are shared templates with no client data; buckets, the knowledge graph, and all tenant content
+      are private per client.
+    </p>
+    <p>
+      A reuse ladder (in-bucket → cross-bucket link → fork → generate) ensures no widget is created twice —
+      the generator only runs when nothing in the library fits.
+    </p>
+    <p style="margin-bottom:0">
+      Users reach widgets through a growing question corpus, and their question sequences drive pre-loading
+      of the next widget.
+    </p>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 2. Layer Diagram                        -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>2 · Layer Diagram</h2>
+  <div class="card">
+    <div class="card-title">Five-Layer Architecture</div>
+    <div class="mermaid" id="layer-diagram">
+flowchart TD
+    subgraph L1["Layer 1 — Client Systems"]
+        ERP["ERP / HRIS\nSAP · Workday · BambooHR"]
+        CLDB["Company Live DB\nread replica"]
+        SEC["Secrets Manager"]
+    end
+
+    subgraph L2["Layer 2 — Assignment Plane"]
+        ING["LLD 1: Ingestion\nPeopleIngestionWorker\nSchemaDiscoveryWorker"]
+        BM["LLD 2: Bucket Matcher\nBucketMatchJob · NewBucketJob"]
+        KGS["LLD 3: KG Selector\nBundleBuildJob"]
+        RL["LLD 4: Reuse Ladder ★"]
+        AG["LLD 10: Access Guard\ncan_access"]
+        BL["LLD 11: Bucket Learner"]
+    end
+
+    subgraph L3["Layer 3 — Generation &amp; Learning"]
+        GEN["LLD 5: Multi-variant Generator\ngeneration_queue"]
+        FB["LLD 9: Feedback Loop\nnovel questions · KG weights"]
+    end
+
+    subgraph L4["Layer 4 — Serving"]
+        QR["LLD 6: Question Router\nPOST /api/ask"]
+        RC["LLD 7: Redis Cache\nRediSearch HNSW"]
+        DR["LLD 8: Data Resolver\nGET /widgets/{id}/data"]
+    end
+
+    subgraph L5["Layer 5 — Stores"]
+        PG["PostgreSQL + pgvector\nKG · widgets · questions"]
+        RD["Redis\nbundle · question index · data cache"]
+        KA["Kafka\nCDC events"]
+    end
+
+    L1 --> L2
+    L2 --> L3
+    L2 --> L4
+    L3 --> L4
+    L4 --> L5
+    L2 --> L5
+
+    note1["★ Reuse Ladder: in-bucket → cross-bucket link → fork → generate\nGenerator only runs when nothing in the library fits"]
+    RL --- note1
+
+    style RL fill:#fef3c7,stroke:#d97706,color:#92400e
+    style note1 fill:#fef9ec,stroke:#fbbf24,color:#78350f
+    style L1 fill:#f0f9ff,stroke:#0ea5e9,color:#0c4a6e
+    style L2 fill:#f0fdf4,stroke:#22c55e,color:#14532d
+    style L3 fill:#faf5ff,stroke:#a855f7,color:#581c87
+    style L4 fill:#fff7ed,stroke:#f97316,color:#7c2d12
+    style L5 fill:#fef2f2,stroke:#ef4444,color:#7f1d1d
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 3. Cross-dependency Diagram             -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>3 · Cross-LLD Dependencies</h2>
+  <div class="card">
+    <div class="card-title">Which LLD triggers / feeds which (event names on edges)</div>
+    <div class="mermaid" id="dep-diagram">
+flowchart LR
+    LLD1["LLD 1\nIngestion"]
+    LLD2["LLD 2\nBucket Matcher"]
+    LLD3["LLD 3\nKG Selector"]
+    LLD4["LLD 4\nReuse Ladder"]
+    LLD5["LLD 5\nGenerator"]
+    LLD6["LLD 6\nQuestion Router"]
+    LLD7["LLD 7\nRedis Cache"]
+    LLD8["LLD 8\nData Resolver"]
+    LLD9["LLD 9\nFeedback Loop"]
+    LLD10["LLD 10\nAccess Guard"]
+    LLD11["LLD 11\nBucket Learner"]
+    DASH["Dashboard\nDelivery"]
+
+    LLD1 -->|"BucketMatchJob"| LLD2
+    LLD1 -->|"schema"| LLD4
+    LLD1 -->|"schema"| LLD8
+    LLD1 -->|"metadata"| LLD10
+
+    LLD2 -->|"BucketAssigned"| LLD3
+    LLD2 -->|"bucket_id"| LLD4
+
+    LLD3 -->|"BundleBuilt +\nuncovered_responsibilities"| LLD4
+    LLD3 -->|"bundle"| LLD7
+
+    LLD4 -->|"rebuild"| LLD3
+    LLD4 -->|"ready gaps"| LLD5
+    LLD4 -->|"cache invalidate"| LLD7
+
+    LLD5 -->|"new widgets"| LLD3
+    LLD5 -->|"seed questions"| LLD6
+    LLD5 -->|"CacheWarmJob"| LLD7
+    LLD5 -->|"metadata"| LLD10
+
+    LLD6 -->|"novel questions\ntransitions"| LLD9
+    LLD6 -->|"global-hit gaps"| LLD4
+    LLD6 -->|"question signals"| LLD11
+
+    LLD7 -->|"serving"| LLD6
+    LLD7 --> DASH
+
+    LLD8 -->|"live/sample tags"| LLD3
+    LLD8 -->|"answers"| LLD6
+    LLD8 -->|"data cache"| LLD7
+
+    LLD9 -->|"KG weights"| LLD3
+    LLD9 -->|"gaps"| LLD4
+    LLD9 -->|"generation triggers"| LLD5
+    LLD9 -->|"index updates"| LLD7
+
+    LLD10 -->|"permissions"| LLD3
+    LLD10 -->|"access decisions"| LLD6
+    LLD10 -->|"cache keys"| LLD7
+    LLD10 -->|"data access"| LLD8
+
+    LLD11 -->|"rebuild"| LLD3
+    LLD11 -->|"bucket gaps"| LLD4
+    LLD11 -->|"cache"| LLD7
+
+    style LLD4 fill:#fef3c7,stroke:#d97706,color:#92400e
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 4. Sequence Diagrams                    -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>4 · End-to-End Sequences</h2>
+
+  <h3>Sequence A — Client Onboarding to First Dashboard</h3>
+  <div class="card">
+    <div class="mermaid" id="seq-a">
+sequenceDiagram
+    participant Admin
+    participant API
+    participant PIW as PeopleIngestionWorker
+    participant BMJ as BucketMatchJob
+    participant BBJ as BundleBuildJob
+    participant RL as ReuseLadder
+    participant Gen as Generator
+    participant Redis
+
+    Admin->>API: Submit connect form (ERP creds, tenant config)
+    API->>PIW: register_connector(tenant_id, creds)
+    PIW->>API: ping ERP / HRIS — validate connection
+    loop Paginate employees
+        PIW->>PIW: Fetch employee page from ERP
+        PIW->>PIW: Normalise JD fields → canonical schema
+    end
+    PIW->>BMJ: fan-out BucketMatchJob per employee
+    BMJ->>BMJ: Score employee against existing buckets
+    alt Existing bucket matches
+        BMJ->>BBJ: emit BucketAssigned(employee_id, bucket_id)
+    else No match — new bucket
+        BMJ->>BBJ: emit NewBucket + BucketAssigned
+    end
+    BBJ->>BBJ: Build responsibility coverage map
+    BBJ->>RL: check coverage gaps
+    alt Library covers all responsibilities
+        RL->>Redis: CacheWarmJob — write bundle
+    else Empty bucket / gaps found
+        RL->>Gen: forward uncovered_responsibilities
+        Gen->>Gen: LLM decompose + generate widget specs
+        Gen->>Admin: push to review queue
+        Admin->>Gen: approve widgets
+        Gen->>Redis: CacheWarmJob
+        Gen->>BBJ: bundle rebuild trigger
+        BBJ->>Redis: bundle written
+    end
+    Redis-->>Admin: Dashboard served (first load)
+    </div>
+  </div>
+
+  <h3>Sequence B — Employee Asks a Question (Happy Path + Denied)</h3>
+  <div class="card">
+    <div class="mermaid" id="seq-b">
+sequenceDiagram
+    participant Emp as Employee
+    participant API
+    participant AG as AccessGuard
+    participant Redis
+    participant QR as QuestionRouter
+    participant DR as DataResolver
+    participant LLM
+
+    Emp->>API: POST /api/ask  { question, employee_id }
+    API->>QR: route(question, employee_id)
+    QR->>Redis: hash lookup — cache hit?
+
+    alt Cache hit
+        Redis-->>QR: cached answer
+        QR-->>API: return answer
+        API-->>Emp: answer response
+    else Cache miss
+        QR->>QR: bucket-first ANN search (RediSearch HNSW)
+        QR->>AG: can_access(employee_id, widget_id)
+
+        alt Access allowed
+            AG-->>QR: allow
+            QR->>DR: GET /widgets/{id}/data
+            DR->>LLM: compose answer with live data
+            LLM-->>DR: answer
+            DR-->>QR: answer + data
+            QR->>Redis: cache(key, answer, ttl)
+            QR-->>API: answer
+            API-->>Emp: answer response
+        else Access denied
+            AG-->>QR: deny (insufficient role)
+            QR-->>API: restricted
+            API-->>Emp: "Restricted for your role" + alternative widgets offered
+        end
+    end
+    </div>
+  </div>
+
+  <h3>Sequence C — Coverage Gap → Reuse Ladder → Generation → Bundle Rebuild</h3>
+  <div class="card">
+    <div class="mermaid" id="seq-c">
+sequenceDiagram
+    participant BBJ as BundleBuildJob
+    participant RL as ReuseLadder
+    participant WL as WidgetLibrary
+    participant Gen as Generator
+    participant RQ as ReviewQueue
+    participant Admin
+    participant BBJ2 as BundleBuildJob (all bucket members)
+
+    BBJ->>RL: BundleBuilt + uncovered_responsibilities[]
+    RL->>RL: aggregate gap list
+    RL->>WL: Rung 1 — exact in-bucket match?
+    WL-->>RL: miss
+    RL->>WL: Rung 2 — cross-bucket ANN similarity search
+    WL-->>RL: miss
+    RL->>WL: Rung 3 — adapt existing widget (fork check)
+    WL-->>RL: miss
+    RL->>Gen: Rung 4 — generate (uncovered_responsibilities)
+    Gen->>Gen: coalesce window (batch similar gaps)
+    Gen->>Gen: priority queue sort
+    Gen->>Gen: LLM decompose responsibilities → widget specs
+    Gen->>Gen: LLM generate widget spec + variants
+    Gen->>Gen: pre-dedupe check against library
+    Gen->>Gen: feasibility + schema validation
+    Gen->>RQ: push to review queue
+    RQ-->>Admin: notify (email / dashboard alert)
+    Admin->>RQ: approve widgets
+    RQ->>WL: write approved widgets
+    WL->>WL: write KG edges (widget ↔ responsibilities)
+    WL->>BBJ2: CacheWarmJob trigger
+    BBJ2->>BBJ2: rebuild bundles for all bucket members
+    BBJ2-->>Admin: bundle ready notification
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 5. Decisions Table                      -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>5 · Architecture Decisions</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Question</th>
+          <th>Decision</th>
+          <th>Effect</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Widget storage model</td>
+          <td>Shared widget templates; tenant data injected at render time</td>
+          <td>Zero data leakage between tenants; single library to maintain</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Bucket granularity</td>
+          <td>Role cluster derived from JD similarity + org-level signals</td>
+          <td>One bundle per bucket; employees with identical roles share cache</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Reuse before generation</td>
+          <td>Four-rung ladder enforced before generator is invoked</td>
+          <td>Generation cost bounded; library grows via reuse not duplication</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Cache layer</td>
+          <td>Redis with RediSearch HNSW for semantic question index</td>
+          <td>Sub-20 ms P99 on cache hit; vector ANN for bucket-first search</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td>Access control granularity</td>
+          <td>Widget-level <code>can_access</code> checked at serving time (LLD 10)</td>
+          <td>Whole-widget blocking is default; scoped data option deferred — <span class="tbd">TBD</span></td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td>KG weight update cadence</td>
+          <td>Feedback loop (LLD 9) batches novel-question signals; nightly weight rebuild</td>
+          <td>KG stays fresh without per-question write amplification; lag <span class="tbd">≤ 24 h TBD</span></td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td>Ingestion concurrency</td>
+          <td>PeopleIngestionWorker paginates; fan-out BucketMatchJob per employee</td>
+          <td>Parallelism bounded by <span class="tbd">worker pool size TBD</span>; back-pressure via Kafka</td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td>New-bucket bootstrap</td>
+          <td>NewBucketJob synthesises a starter bundle from nearest-neighbour buckets</td>
+          <td>Day-one dashboard even for novel roles; quality improves as Feedback Loop runs</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 6. Open Questions                       -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>6 · Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Unresolved — needs a decision before implementation</div>
+    <ul>
+      <li>
+        <strong>First ERP / HRIS integration target</strong> — which system (SAP, Workday, or BambooHR) is the
+        first integration target is not decided; shapes connector interface and SchemaDiscoveryWorker priority.
+      </li>
+      <li>
+        <strong>Field-level data scoping</strong> — whole-widget blocking is the current default in LLD 10;
+        <strong>field-level scoping (restricting specific data columns rather than the whole widget) is confirmed as a requirement</strong>
+        and must be designed into the DataResolver contract and cache key structure. Scoped results already use
+        <code>data_scope</code> as a SQL predicate — the open work is expanding this to column-level filtering.
+      </li>
+    </ul>
+  </div>
+
+  <!-- ─────────────────────────────────────── -->
+  <!-- 7. Page Navigation                      -->
+  <!-- ─────────────────────────────────────── -->
+  <h2>7 · All Pages</h2>
+  <div class="nav-grid">
+    <a href="index.html">HLD — This Page</a>
+    <a href="lld/lld-01-ingestion.html">LLD 01 — Ingestion</a>
+    <a href="lld/lld-02-bucket-matcher.html">LLD 02 — Bucket Matcher</a>
+    <a href="lld/lld-03-kg-selector.html">LLD 03 — KG Selector</a>
+    <a href="lld/lld-04-reuse-ladder.html">LLD 04 — Reuse Ladder</a>
+    <a href="lld/lld-05-generator.html">LLD 05 — Generator</a>
+    <a href="lld/lld-06-question-router.html">LLD 06 — Question Router</a>
+    <a href="lld/lld-07-redis-cache.html">LLD 07 — Redis Cache</a>
+    <a href="lld/lld-08-data-resolver.html">LLD 08 — Data Resolver</a>
+    <a href="lld/lld-09-feedback-loop.html">LLD 09 — Feedback Loop</a>
+    <a href="lld/lld-10-access-guard.html">LLD 10 — Access Guard</a>
+    <a href="lld/lld-11-bucket-learner.html">LLD 11 — Bucket Learner</a>
+    <a href="schema.html">Schema</a>
+  </div>
+
+</main>
+
+<!-- ── Mermaid ── -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  // ── Dark mode ──────────────────────────────────────────────────────────────
+  const body        = document.body;
+  const toggleBtn   = document.getElementById('dark-toggle');
+  const toggleIcon  = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+
+  let darkMode = false;
+
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent  = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme', 'dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent  = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme', 'light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+
+  // Respect saved preference
+  const saved = localStorage.getItem('theme');
+  if (saved === 'dark') applyTheme(true);
+
+  // ── Mermaid ────────────────────────────────────────────────────────────────
+  const MERMAID_IDS = ['layer-diagram', 'dep-diagram', 'seq-a', 'seq-b', 'seq-c'];
+
+  // Store original sources before first render
+  const sources = {};
+  MERMAID_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) sources[id] = el.textContent.trim();
+  });
+
+  function rerenderMermaid(theme) {
+    // Reset each mermaid div to raw source then re-run
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+
+  // Initial render
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  });
+</script>
+
+</body>
+</html>

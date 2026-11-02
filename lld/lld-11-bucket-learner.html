@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 11 — Bucket Learner | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html" class="active">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 11 — Bucket Learner <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <h1>LLD 11 — Bucket Learner</h1>
+  <p class="page-intro">
+    Tracks which buckets answer each user's questions, accumulates evidence with time decay, and automatically adds a
+    secondary bucket once a clear pattern emerges — then removes it if the pattern fades.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Automatically detects when an employee's actual day-to-day work has outgrown their primary role group and quietly adds a secondary bucket — giving them access to that bucket's widgets on their dashboard.</p>
+    <p>Every time an employee's question is answered by a widget from a bucket that is not their primary, a signal is recorded. An affinity scorer maintains a time-decaying score per (user, bucket) pair — recent behaviour weighs more than old behaviour. The score only triggers a secondary assignment when it crosses a threshold <strong>AND</strong> at least a minimum number of distinct questions have contributed <strong>AND</strong> at least a minimum number of distinct days have contributed. One busy afternoon does not decide anything.</p>
+    <p>The lifecycle has six states: <em>candidate → inferred secondary → confirmed → expired</em>, with <em>admin blocked</em> as a circuit breaker. <strong>Hysteresis prevents flickering</strong> — the removal threshold is lower than the add threshold, so a secondary bucket will not be removed just because signals temporarily drop.</p>
+    <p>When the same secondary bucket appears as a pattern across many members of one primary bucket, that is a structural signal — LLD 04 (Reuse Ladder) is notified to link the most-used widgets from the secondary directly into the primary, resolving the pattern for the whole bucket rather than each individual.</p>
+  </div>
+
+  <!-- 1. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Trigger:</strong> Every routed question answered by a widget not in the user's primary bucket. Runs on events — not a schedule.<br/>
+    <strong>Outputs:</strong> Secondary bucket assignments → BundleBuildJob (LLD 3) + cache update (LLD 7); bucket-level gap entries (→ LLD 4)
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["LLD 6\nQuestion Router\n(every routed question)"] --> B["LLD 11\nBucket Learner"]
+    B --> C["user_bucket_affinity\n(score update)"]
+    C -->|"threshold crossed"| D["BundleBuildJob\n(LLD 3) + cache LLD 7"]
+    C -->|"score decayed"| E["Expire secondary\n→ BundleBuildJob"]
+    B --> F["bucket_coverage_gaps\n(LLD 4 — bucket-level)"]
+    </div>
+  </div>
+
+  <!-- 2. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Routed question answered outside primary bucket</td>
+          <td><code>{user_id, matched_widget_id, widget_buckets, in_primary: false}</code></td>
+          <td>LLD 6 — Question Router</td>
+          <td>Question signal recorder → affinity scorer</td>
+        </tr>
+        <tr>
+          <td>Routed question denied (but widget belongs to non-primary bucket)</td>
+          <td><code>{user_id, widget_id, widget_buckets, denied: true}</code></td>
+          <td>LLD 10 — Access Guard</td>
+          <td>Question signal recorder (counts as evidence of need)</td>
+        </tr>
+        <tr>
+          <td>Affinity score update (per-event debounced)</td>
+          <td><code>{user_id, bucket_id, new_score}</code></td>
+          <td>Affinity scorer (this)</td>
+          <td>Decision evaluator</td>
+        </tr>
+        <tr>
+          <td>inferred_secondary added</td>
+          <td><code>{user_id, bucket_id, score, evidence_question_ids}</code></td>
+          <td>Decision evaluator (this)</td>
+          <td>Admin notifier, BundleBuildJob fan-out</td>
+        </tr>
+        <tr>
+          <td>Score decayed below remove_threshold</td>
+          <td><code>{user_id, bucket_id}</code></td>
+          <td>Affinity scorer (this)</td>
+          <td>Decision evaluator → expire → BundleBuildJob</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Question Signal Recorder</div>
+    <p><strong>Responsibility:</strong> For every routed question answered by a widget outside the user's primary bucket, record evidence for each bucket the matched widget belongs to. Denied matches count too — they signal what the user is trying to find even if access blocks them.</p>
+    <p><strong>Interface:</strong> <code>recordSignal(user_id, widget_id, widget_buckets, in_primary, denied) → void</code></p>
+    <p><strong>Writes:</strong> <code>user_bucket_affinity</code> pending-update buffer (debounced before Postgres write)</p>
+    <p><strong>Note:</strong> Whether denied signals should count toward promotion is an open question — see section 10.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Affinity Scorer (per-event with time decay)</div>
+    <p><strong>Responsibility:</strong> Updates <code>user_bucket_affinity.score</code> on each recorded event. Recent behaviour weighs more than old behaviour. One busy afternoon from one user does not decide anything — both distinct-question and distinct-day guards must be met before promotion.</p>
+    <p><strong>Score formula:</strong> <code>score = decayed_previous × AFFINITY_TIME_DECAY_HALF_LIFE_DAYS + event_weight × recency_multiplier</code></p>
+    <p><strong>Writes:</strong> <code>user_bucket_affinity.score</code>, <code>user_bucket_affinity.last_event_ts</code>, <code>user_bucket_affinity.distinct_question_count</code>, <code>user_bucket_affinity.distinct_day_count</code></p>
+    <p style="margin-top:8px;font-size:0.8125rem;color:var(--txt-muted)">ponytail: half-life decay is a scalar; upgrade to per-signal-type weights if signal heterogeneity grows.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Decision Evaluator (per-event, debounced per user)</div>
+    <p><strong>Responsibility:</strong> Evaluates whether to add or remove a secondary bucket after each affinity update. Uses hysteresis (add_threshold &gt; remove_threshold) to prevent flickering — a bucket assigned as secondary won't be removed until the score drops meaningfully below the add threshold.</p>
+    <p><strong>Add condition:</strong> <code>score ≥ AFFINITY_ADD_THRESHOLD</code> AND <code>distinct_questions ≥ AFFINITY_MIN_DISTINCT_QUESTIONS</code> AND <code>distinct_days ≥ AFFINITY_MIN_DISTINCT_DAYS</code></p>
+    <p><strong>Remove condition:</strong> <code>score &lt; AFFINITY_REMOVE_THRESHOLD</code> (and status is inferred_secondary, not confirmed)</p>
+    <p><strong>Debounce:</strong> <code>AFFINITY_DEBOUNCE_MS</code> <span class="tbd">TBD</span> — multiple rapid signals per user collapse to one evaluation.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Lifecycle State Machine Driver</div>
+    <p><strong>Responsibility:</strong> Executes lifecycle transitions (candidate → inferred_secondary → confirmed → expired → admin_blocked) and writes each transition to <code>bucket_assignment_decisions</code> with evidence.</p>
+    <p><strong>Writes:</strong> <code>user_bucket_map</code> (add/remove secondary row), <code>bucket_assignment_decisions</code> (append-only audit), <code>user_bucket_affinity.status</code></p>
+    <p><strong>Explainability:</strong> Every transition records the current score and evidence_question_ids. Admin can read: "Added after 9 procurement questions over 3 weeks."</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Admin Notifier</div>
+    <p><strong>Responsibility:</strong> Emits a notification when a bucket transitions to <code>inferred_secondary</code>. Admin can reverse — sets <code>status = expired</code> and sets an admin_blocked flag that prevents re-inference until the admin lifts it.</p>
+    <p><strong>Interface:</strong> <code>notifyAdmin(tenant_id, user_id, bucket_id, evidence_summary) → void</code></p>
+    <p><strong>Writes:</strong> Admin notification queue; <code>user_bucket_affinity.admin_blocked</code> (if reversed)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bundle Rebuild Trigger</div>
+    <p><strong>Responsibility:</strong> Each status change (inferred_secondary added, expired) triggers a <code>BundleBuildJob</code> for the affected user (LLD 3) and a cache update (LLD 7). The rebuild picks up the new secondary bucket's widgets automatically.</p>
+    <p><strong>Interface:</strong> <code>triggerBundleRebuild(user_id) → void</code></p>
+    <p><strong>Effect on routing:</strong> After rebuild, LLD 6 searches primary first, then inferred + confirmed secondaries, then the global library.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Bucket-Level Gap Detector</div>
+    <p><strong>Responsibility:</strong> When many members of one primary bucket gain the same inferred secondary bucket, raise a <code>bucket_coverage_gaps</code> entry for LLD 4. LLD 4 will typically link the most-used widgets from the secondary into the primary to resolve the pattern structurally.</p>
+    <p><strong>Threshold:</strong> <code>BUCKET_LEVEL_GAP_MIN_MEMBERS</code> <span class="tbd">TBD</span></p>
+    <p><strong>Writes:</strong> <code>bucket_coverage_gaps</code> row tagged with both primary and secondary bucket IDs</p>
+  </div>
+
+  <!-- 4. State Machine -->
+  <h2>4 · Bucket Affinity Lifecycle State Machine</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+stateDiagram-v2
+    [*] --> candidate: first signal recorded outside primary bucket
+    candidate --> inferred_secondary: score ≥ add_threshold AND min_distinct_questions AND min_distinct_days
+    inferred_secondary --> confirmed: admin or user confirms
+    inferred_secondary --> expired: score decays below remove_threshold
+    confirmed --> expired: admin removes (confirmed buckets don't expire on their own)
+    expired --> candidate: new signals accumulate (if not admin_blocked)
+    expired --> admin_blocked: admin reverses an inferred_secondary
+    admin_blocked --> candidate: admin lifts block
+    </div>
+    <p style="margin-top:12px;font-size:0.875rem;color:var(--txt-muted)">
+      Stored in <code>user_bucket_affinity.status</code>. <strong>confirmed</strong> status does not expire on its own — only admin removal moves it to expired.
+      <strong>admin_blocked</strong> prevents re-inference until the admin explicitly lifts the block.
+    </p>
+  </div>
+
+  <!-- 5. Effect on User -->
+  <h2>5 · Effect on the User</h2>
+  <div class="card">
+    <p><strong>Routing order after inferred_secondary added:</strong> primary bucket → inferred + confirmed secondaries → global widget library.</p>
+    <p><strong>Dashboard:</strong> A section appears with the secondary bucket's most-used widgets, filtered by the access guard. The section label explains why it appeared ("You often ask procurement questions").</p>
+    <p><strong>Each status change:</strong> Triggers a bundle rebuild so the next request picks up the change without a manual refresh.</p>
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Router as LLD 6 Question Router
+    participant Learner as LLD 11 Bucket Learner
+    participant Scorer as Affinity Scorer
+    participant Eval as Decision Evaluator
+    participant Admin
+    participant Builder as BundleBuildJob (LLD 3)
+
+    Router->>Learner: signal(user_id, widget_buckets, in_primary=false)
+    Learner->>Scorer: update score with time decay
+    Scorer->>Eval: new score (debounced)
+    alt threshold crossed
+        Eval->>Eval: transition → inferred_secondary
+        Eval->>Admin: notify (admin can reverse)
+        Eval->>Builder: triggerBundleRebuild(user_id)
+        Builder-->>Builder: new bundle includes secondary bucket widgets
+    else score decayed below remove_threshold
+        Eval->>Eval: transition → expired
+        Eval->>Builder: triggerBundleRebuild(user_id)
+        Builder-->>Builder: secondary bucket removed from bundle
+    else accumulating
+        Eval->>Eval: stay in candidate
+    end
+    </div>
+  </div>
+
+  <!-- 6. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <p style="color:var(--txt-muted);font-size:0.875rem">LLD 11 does not own any Redis keys directly. Status changes trigger BundleBuildJob (LLD 3) which writes <code>bundle:{user_id}</code> via LLD 7.</p>
+
+  <!-- 7. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>user_bucket_affinity</code></td><td>W (score + status updates)</td><td><a href="../schema.html#user_bucket_affinity">schema → user_bucket_affinity</a></td></tr>
+        <tr><td><code>bucket_assignment_decisions</code></td><td>W (append-only audit)</td><td><a href="../schema.html#bucket_assignment_decisions">schema → bucket_assignment_decisions</a></td></tr>
+        <tr><td><code>bucket_coverage_gaps</code></td><td>W (bucket-level gaps)</td><td><a href="../schema.html#bucket_coverage_gaps">schema → bucket_coverage_gaps</a></td></tr>
+        <tr><td><code>user_bucket_map</code></td><td>W (add/remove secondary rows)</td><td><a href="../schema.html#user_bucket_map">schema → user_bucket_map</a></td></tr>
+        <tr><td><code>kg_edges</code></td><td>R (find which buckets a widget belongs to)</td><td><a href="../schema.html#kg_edges">schema → kg_edges</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>AFFINITY_ADD_THRESHOLD</code></td><td>Score at which a candidate bucket transitions to inferred_secondary</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>AFFINITY_REMOVE_THRESHOLD</code></td><td>Score below which an inferred_secondary transitions to expired (must be &lt; add threshold)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>AFFINITY_MIN_DISTINCT_QUESTIONS</code></td><td>Min distinct questions required before add_threshold triggers promotion</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>AFFINITY_MIN_DISTINCT_DAYS</code></td><td>Min distinct days with signals before add_threshold triggers promotion</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>AFFINITY_TIME_DECAY_HALF_LIFE_DAYS</code></td><td>Half-life for score decay; controls how quickly old signals lose weight</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>AFFINITY_DEBOUNCE_MS</code></td><td>Debounce window to collapse rapid per-user signals into one evaluation</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>BUCKET_LEVEL_GAP_MIN_MEMBERS</code></td><td>How many primary-bucket members must gain the same secondary before raising a bucket-level coverage gap</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-06-question-router.html">LLD 6 — Question Router</a></td><td>Every routed question signal (matched widget + bucket membership)</td></tr>
+        <tr><td>In ←</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>Denied match signals (show what user needs even if access blocked)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td>BundleBuildJob triggered on each status change</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td>bundle:{user_id} updated after rebuild (via LLD 3)</td></tr>
+        <tr><td>Out →</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td>bucket_coverage_gaps entries when pattern is systemic across primary-bucket members</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Admin blocks re-inference after reversal — user's affinity score for that bucket can still accumulate, but will never trigger inferred_secondary again until the admin lifts the block. Score is not cleared.</li>
+      <li>User changes primary bucket (LLD 2 re-runs) — all inferred_secondary and candidate affinity scores are retained; the new primary is checked against existing secondaries to avoid circular assignment.</li>
+      <li>Widget belongs to three buckets — evidence is credited to all three simultaneously; the most-evidenced bucket promotes first.</li>
+      <li>Score oscillates around remove_threshold — hysteresis gap between add and remove thresholds is the primary defence; gap must be wide enough to absorb weekly usage variance.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>Should inferred secondary buckets appear on the user's dashboard immediately (at inferred_secondary) or only after admin or user confirmation (confirmed)?</li>
+      <li>Should denied-match signals count as affinity evidence? A user denied access to a widget repeatedly may be signalling need — but their access level was checked and rejected. Counting these could make the access guard feel like it is working against itself.</li>
+      <li>Cold start: a new bucket has no question-sequence data in the transition graph. Should LLD 11 fall back to nearest-bucket transitions until enough sessions accumulate, or simply require a minimum session count before activating?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','sm','flow'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) sources[id] = el.textContent.trim();
+    });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme','dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme','light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  const saved = localStorage.getItem('theme');
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (saved === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

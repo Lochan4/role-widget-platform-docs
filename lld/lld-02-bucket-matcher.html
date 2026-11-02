@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 02 — Bucket Matcher | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html" class="active">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 02 — Bucket Matcher <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 02 — Bucket Matcher</h1>
+  <p class="page-intro">
+    Places each employee in exactly one primary bucket by comparing their profile vector against existing bucket profiles.
+    Creates new buckets from unmatched clusters.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Takes each employee's embedded profile (built from their title, department, and all responsibility chunks) and assigns them to the right role group — a "bucket". It runs an approximate nearest-neighbour search against all existing bucket profiles and scores each candidate using a formula that combines vector similarity, responsibility overlap, and title keyword match.</p>
+    <p>There are three outcomes based on how confident the match is:</p>
+    <ul>
+      <li><strong>High confidence</strong> — automatically assigned, no review needed.</li>
+      <li><strong>Medium confidence</strong> — provisionally assigned and queued for an admin to confirm.</li>
+      <li><strong>Low / no match</strong> — added to an "unbucketed pool" to wait for enough similar people to accumulate.</li>
+    </ul>
+    <p>When the pool is big enough, <code>NewBucketJob</code> runs a clustering algorithm, creates a draft bucket per cluster, and uses an LLM to name each cluster from its members' job titles. Even single-person clusters get their own bucket.</p>
+    <p>There is also <strong>secondary bucket assignment</strong> — if an employee scores above a lower threshold on a second bucket, they are quietly tagged as secondary. This comes into play later when the question router widens its search beyond the primary bucket.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Input:</strong> <code>BucketMatchJob(user_id)</code> from LLD 1<br/>
+    <strong>Outputs:</strong> <code>BucketAssigned</code> event → LLD 3 &amp; LLD 4; draft buckets → KG
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["BucketMatchJob(user_id)\n← LLD 1"] --> B["LLD 2\nBucket Matcher"]
+    B --> C["BucketAssigned\n→ LLD 3"]
+    B --> D["BucketAssigned\n→ LLD 4"]
+    B --> E["bucket_version bump\n→ Redis"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>BucketMatchJob(user_id)</code></td>
+          <td><code>{user_id, tenant_id}</code></td>
+          <td>LLD 1 fan-out</td>
+          <td>Profile vector builder (this LLD)</td>
+        </tr>
+        <tr>
+          <td><code>BucketAssigned</code></td>
+          <td><code>{user_id, bucket_id, method: 'auto'|'provisional'}</code></td>
+          <td>BucketMatchJob (this LLD)</td>
+          <td>LLD 3 KG Selector, LLD 4 Reuse Ladder</td>
+        </tr>
+        <tr>
+          <td><code>NewBucketJob</code></td>
+          <td><code>{tenant_id, cluster_member_ids[]}</code></td>
+          <td>Unbucketed pool settler (this LLD)</td>
+          <td>NewBucketJob worker (this LLD)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">Profile Vector Builder</div>
+    <p><strong>Responsibility:</strong> Produce a single dense embedding for the employee combining raw_title, department, and all responsibility chunks.</p>
+    <p><strong>Interface:</strong> <code>buildProfileVector(user_id) → Float32Array</code></p>
+    <p><strong>Reads:</strong> <code>tenant_users</code>, <code>user_responsibilities</code></p>
+    <p><strong>Writes:</strong> <code>tenant_users.profile_vector</code></p>
+    <p><strong>Idempotency:</strong> Re-run produces identical vector for same inputs; safe to retry.</p>
+    <p><strong>Failure handling:</strong> Embedding API failure → retry with backoff; job fails and requeues if all retries exhausted.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">ANN Candidate Search</div>
+    <p><strong>Responsibility:</strong> Query pgvector HNSW on <code>bucket_embeddings</code>; return all buckets above <code>BUCKET_CANDIDATE_THRESHOLD</code> (not fixed top-k).</p>
+    <p><strong>Interface:</strong> <code>findCandidateBuckets(profileVector, tenantId) → BucketCandidate[]</code></p>
+    <p><strong>Reads:</strong> <code>bucket_embeddings</code> via pgvector HNSW index</p>
+    <p><strong>Writes:</strong> None</p>
+    <p><strong>Idempotency:</strong> Read-only.</p>
+    <p><strong>Failure handling:</strong> pgvector unavailable → job fails and requeues.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Scoring Function</div>
+    <p><strong>Responsibility:</strong> Compute a combined match score for each candidate bucket.</p>
+    <p><strong>Formula:</strong> <code>score = (profile_cosine × W_cos) + (responsibility_overlap × W_resp) + (title_keyword_boost × W_title)</code></p>
+    <p>Responsibility overlap = share of user's responsibility chunks matching a responsibility node in that bucket. Weights are config values.</p>
+    <p><strong>Interface:</strong> <code>scoreCandidates(user_id, candidates: BucketCandidate[]) → ScoredBucket[]</code></p>
+    <p><strong>Reads:</strong> <code>kg_nodes</code>, <code>kg_edges</code> for bucket responsibility membership</p>
+    <p><strong>Writes:</strong> None</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Confidence Router</div>
+    <p><strong>Responsibility:</strong> Route based on top score: high → auto-assign; medium → provisional + queue review; low / no candidate → unbucketed pool.</p>
+    <p><strong>Interface:</strong> <code>routeByConfidence(user_id, scores: ScoredBucket[]) → void</code></p>
+    <p><strong>Reads:</strong> Config thresholds</p>
+    <p><strong>Writes:</strong> <code>user_bucket_map</code> (on assign); admin review queue (on provisional); unbucketed pool table (on low)</p>
+    <p><strong>Failure handling:</strong> Any write failure → job requeues; upsert semantics prevent duplicates.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">NewBucketJob</div>
+    <p><strong>Responsibility:</strong> When the unbucketed pool settles post-onboarding (then nightly), run HDBSCAN on profile vectors; create a draft bucket per cluster; use LLM to name each bucket from member titles; singletons get their own draft bucket.</p>
+    <p><strong>Interface:</strong> <code>NewBucketJob.run(tenant_id) → {created: number, draft_bucket_ids: string[]}</code></p>
+    <p><strong>Reads:</strong> Unbucketed pool, <code>tenant_users.profile_vector</code></p>
+    <p><strong>Writes:</strong> <code>buckets</code> (status=draft), <code>user_bucket_map</code>, <code>bucket_embeddings</code></p>
+    <p><strong>Idempotency:</strong> Idempotent within a run window; re-running with same pool produces same clusters (deterministic seed).</p>
+    <p><strong>Failure handling:</strong> LLM naming failure → bucket saved with auto-generated placeholder name; admin can rename.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Secondary Bucket Assigner</div>
+    <p><strong>Responsibility:</strong> If an employee has strong overlap with a second bucket (above <code>SECONDARY_BUCKET_OVERLAP_THRESHOLD</code>), assign it as secondary. Secondary buckets are searchable by Question Router but not shown on dashboard by default.</p>
+    <p><strong>Interface:</strong> <code>assignSecondaryBucket(user_id, scores: ScoredBucket[]) → void</code></p>
+    <p><strong>Reads:</strong> Scored bucket list from Scoring Function</p>
+    <p><strong>Writes:</strong> <code>user_bucket_map</code> (role=secondary)</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">BucketAssigned Emitter</div>
+    <p><strong>Responsibility:</strong> Upsert <code>user_bucket_map</code> and emit <code>BucketAssigned(user_id, bucket_id)</code> to trigger bundle build and gap analysis.</p>
+    <p><strong>Interface:</strong> <code>emitBucketAssigned(user_id, bucket_id, method) → void</code></p>
+    <p><strong>Reads:</strong> None</p>
+    <p><strong>Writes:</strong> <code>user_bucket_map</code>, Kafka topic / event bus</p>
+    <p><strong>Idempotency:</strong> Upsert; duplicate emit is safe (consumers are idempotent).</p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Q as Job Queue
+    participant PVB as Profile Vector Builder
+    participant ANN as ANN Candidate Search
+    participant SF as Scoring Function
+    participant CR as Confidence Router
+    participant UP as Unbucketed Pool
+    participant NBJ as NewBucketJob
+    participant Emit as BucketAssigned Emitter
+
+    Q->>PVB: BucketMatchJob(user_id)
+    PVB->>PVB: embed title + dept + chunks
+    PVB->>ANN: findCandidateBuckets(vector)
+    ANN-->>SF: candidates[]
+    SF->>SF: score each candidate
+    SF-->>CR: ScoredBucket[]
+    alt High confidence
+        CR->>Emit: assign (method=auto)
+        Emit-->>Q: BucketAssigned emitted
+    else Medium confidence
+        CR->>Emit: assign (method=provisional)
+        CR->>CR: queue admin review
+        Emit-->>Q: BucketAssigned emitted
+    else Low / no candidate
+        CR->>UP: add to unbucketed pool
+        note over UP,NBJ: Pool settles → NewBucketJob runs
+        NBJ->>NBJ: HDBSCAN cluster
+        NBJ->>NBJ: LLM name clusters
+        NBJ->>Emit: draft bucket assigned
+        Emit-->>Q: BucketAssigned emitted
+    end
+    </div>
+  </div>
+
+  <!-- 6. State Machine — Bucket Status -->
+  <h2>5 · State Machine — Bucket Status</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+stateDiagram-v2
+    [*] --> draft : NewBucketJob creates cluster
+    draft --> active : Admin approves or auto-activate threshold reached
+    active --> deprecated : Bucket merged into another or no active members
+    deprecated --> [*]
+    </div>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key pattern</th><th>Type</th><th>TTL</th><th>Invalidated by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>bucket:{id}:v</code></td>
+          <td>String (integer version counter)</td>
+          <td>No TTL (evicted on key rename)</td>
+          <td>Any membership change in the bucket (emit from BucketAssigned Emitter)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>buckets</code></td><td>W (insert draft, update status)</td><td><a href="../schema.html#buckets">schema → buckets</a></td></tr>
+        <tr><td><code>user_bucket_map</code></td><td>W (upsert)</td><td><a href="../schema.html#user_bucket_map">schema → user_bucket_map</a></td></tr>
+        <tr><td><code>user_responsibilities</code></td><td>R</td><td><a href="../schema.html#user_responsibilities">schema → user_responsibilities</a></td></tr>
+        <tr><td><code>kg_nodes</code></td><td>R/W (bucket responsibility nodes)</td><td><a href="../schema.html#kg_nodes">schema → kg_nodes</a></td></tr>
+        <tr><td><code>kg_edges</code></td><td>R/W (CONTAINS edges)</td><td><a href="../schema.html#kg_edges">schema → kg_edges</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>BUCKET_CANDIDATE_THRESHOLD</code></td><td>Minimum cosine similarity for a bucket to enter candidate pool</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>BUCKET_HIGH_CONFIDENCE_THRESHOLD</code></td><td>Score above which assignment is auto (no review)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>BUCKET_MEDIUM_CONFIDENCE_THRESHOLD</code></td><td>Score above which assignment is provisional (queued for review)</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>RESPONSIBILITY_OVERLAP_WEIGHT</code></td><td>Weight of responsibility overlap term in scoring function</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>TITLE_KEYWORD_BOOST_WEIGHT</code></td><td>Weight of title keyword boost term in scoring function</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>SECONDARY_BUCKET_OVERLAP_THRESHOLD</code></td><td>Minimum score to assign a secondary bucket</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>HDBSCAN_MIN_CLUSTER_SIZE</code></td><td>Minimum members for HDBSCAN to form a cluster (singletons still get a draft bucket)</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>In ←</td><td><a href="lld-01-ingestion.html">LLD 1 — Ingestion</a></td><td><code>BucketMatchJob(user_id)</code> per changed employee</td></tr>
+        <tr><td>Out →</td><td><a href="lld-03-kg-selector.html">LLD 3 — KG Selector</a></td><td><code>BucketAssigned(user_id, bucket_id)</code></td></tr>
+        <tr><td>Out →</td><td><a href="lld-04-reuse-ladder.html">LLD 4 — Reuse Ladder</a></td><td><code>BucketAssigned</code> triggers gap analysis for new bucket members</td></tr>
+        <tr><td>Out →</td><td><a href="lld-07-redis-cache.html">LLD 7 — Redis Cache</a></td><td><code>bucket:{id}:v</code> version bump on membership change</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>All employees for a new tenant score low confidence → entire tenant lands in unbucketed pool; NewBucketJob runs after onboarding and creates draft buckets for the whole org.</li>
+      <li>Singleton cluster from HDBSCAN → still gets a draft bucket; one-person bucket is valid and will accumulate a dedicated widget bundle.</li>
+      <li>Bucket name collision (LLM generates duplicate name) → append a disambiguating suffix; admin can rename before activation.</li>
+      <li>Secondary bucket same as primary (score ties) → dedup in Secondary Bucket Assigner; never assign the same bucket in both roles.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>When should a provisional bucket assignment auto-promote to confirmed without admin review (e.g., after N days with no dispute)?</li>
+      <li>Should bucket version increment trigger immediate bundle rebuild for all members or only invalidate cache?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (el) sources[id] = el.textContent.trim(); });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => { const el = document.getElementById(id); if (!el) return; el.removeAttribute('data-processed'); el.innerHTML = sources[id]; });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    body.classList.toggle('dark', dark);
+    toggleIcon.textContent = dark ? '☀️' : '🌙';
+    toggleLabel.textContent = dark ? 'Light' : 'Dark';
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (localStorage.getItem('theme') === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>

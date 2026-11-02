@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LLD 01 — Ingestion | Role Widget Platform</title>
+  <link rel="stylesheet" href="../assets/style.css"/>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">Role Widget Platform</div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="../index.html">HLD</a>
+    <a href="../schema.html">Schema</a>
+    <div class="nav-section">Low-Level Design</div>
+    <a href="lld-01-ingestion.html" class="active">01 — Ingestion</a>
+    <a href="lld-02-bucket-matcher.html">02 — Bucket Matcher</a>
+    <a href="lld-03-kg-selector.html">03 — KG Selector</a>
+    <a href="lld-04-reuse-ladder.html">04 — Reuse Ladder</a>
+    <a href="lld-05-generator.html">05 — Generator</a>
+    <a href="lld-06-question-router.html">06 — Question Router</a>
+    <a href="lld-07-redis-cache.html">07 — Redis Cache</a>
+    <a href="lld-08-data-resolver.html">08 — Data Resolver</a>
+    <a href="lld-09-feedback-loop.html">09 — Feedback Loop</a>
+    <a href="lld-10-access-guard.html">10 — Access Guard</a>
+    <a href="lld-11-bucket-learner.html">11 — Bucket Learner</a>
+  </nav>
+</aside>
+
+<header class="top-header">
+  <div class="header-title">LLD 01 — Ingestion <span>/ Role Widget Platform</span></div>
+  <button id="dark-toggle" aria-label="Toggle dark mode">
+    <span id="toggle-icon">🌙</span>
+    <span id="toggle-label">Dark</span>
+  </button>
+</header>
+
+<main class="main-content">
+
+  <!-- 1. Page Header -->
+  <h1>LLD 01 — Ingestion</h1>
+  <p class="page-intro">
+    Turns a client ERP connection into normalised employees with JD chunks and hands each to bucket matching.
+    Re-runs nightly and on webhook events.
+  </p>
+
+  <div class="plain-summary">
+    <div class="plain-summary-label">Plain English</div>
+    <p>Connects to a client's HR or ERP system and syncs all employees into the platform. There are two sync modes: a <strong>full sync</strong> triggered when a new client first connects, and a <strong>nightly delta sync</strong> that re-processes only employees whose records have changed (new hire, role change, etc.). <strong>Job description edits are handled by webhook only</strong> — the nightly cron does not re-process JDs; the ERP pushes a webhook whenever a JD changes.</p>
+    <p>The core worker (<code>PeopleIngestionWorker</code>) pages through the ERP's employee API. For each employee it runs <code>JDNormalizer</code>, which extracts responsibility bullet points from the job description — falling back to a title + department template if no JD exists — and embeds them as vectors. In parallel, <code>SchemaDiscoveryWorker</code> reads the client's database structure and suggests which of their actual table names map to the generic aliases the platform's SQL templates use (e.g. their real table <code>tbl_emp_current</code> maps to the generic alias <code>hr_employees</code>).</p>
+    <p>At the end, a <code>BucketMatchJob</code> is queued for every employee whose JD hash changed. <strong>The system is idempotent</strong> — re-running the same sync produces the same result. A broken ERP connection only blocks that step; everything already synced is untouched.</p>
+  </div>
+
+  <!-- 2. Position in HLD -->
+  <h2>1 · Position in HLD</h2>
+  <div class="lld-mini">
+    <strong>Inputs:</strong> Admin ERP credentials, nightly cron, webhook events (new hire / role change / JD edit)<br/>
+    <strong>Outputs:</strong> <code>BucketMatchJob(user_id)</code> fan-out → LLD 2; schema mappings → LLD 8
+    <div class="mermaid" id="mini">
+flowchart LR
+    A["ERP / HRIS\n(credentials)"] --> B["LLD 1\nIngestion"]
+    C["Nightly cron\n/ Webhooks"] --> B
+    B --> D["BucketMatchJob\n→ LLD 2"]
+    B --> E["tenant_schema_registry\n→ LLD 8"]
+    </div>
+  </div>
+
+  <!-- 3. Triggers & Events -->
+  <h2>2 · Triggers &amp; Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Payload</th><th>Producer</th><th>Consumers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>POST /api/tenants/{tenant_id}/connect</code></td>
+          <td><code>{erp_type, credentials, config}</code></td>
+          <td>Admin UI</td>
+          <td>ErpConnector, PeopleIngestionWorker</td>
+        </tr>
+        <tr>
+          <td>Nightly delta sync (cron)</td>
+          <td><code>{tenant_id}</code></td>
+          <td>Scheduler</td>
+          <td>PeopleIngestionWorker</td>
+        </tr>
+        <tr>
+          <td>Webhook: new hire</td>
+          <td><code>{tenant_id, external_id, event_type}</code></td>
+          <td>ERP system</td>
+          <td>PeopleIngestionWorker</td>
+        </tr>
+        <tr>
+          <td>Webhook: role change</td>
+          <td><code>{tenant_id, external_id, changed_fields}</code></td>
+          <td>ERP system</td>
+          <td>PeopleIngestionWorker, JD Normalizer</td>
+        </tr>
+        <tr>
+          <td>Webhook: JD edit</td>
+          <td><code>{tenant_id, external_id, jd_text}</code></td>
+          <td>ERP system</td>
+          <td>JD Normalizer, BucketMatchJob fan-out</td>
+        </tr>
+        <tr>
+          <td><code>BucketMatchJob(user_id)</code></td>
+          <td><code>{user_id, tenant_id}</code></td>
+          <td>LLD 1 (this)</td>
+          <td>LLD 2 Bucket Matcher</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4. Components -->
+  <h2>3 · Components</h2>
+
+  <div class="card">
+    <div class="card-title">POST /api/tenants/{tenant_id}/connect</div>
+    <p><strong>Responsibility:</strong> Validate ERP type and credentials shape; store credentials in Secrets Manager; initialise tenant state rows.</p>
+    <p><strong>Interface:</strong> <code>POST /api/tenants/:tenant_id/connect → 202 Accepted | 400 | 409</code></p>
+    <p><strong>Writes:</strong> <code>tenant_erp_connections</code> (status=pending), <code>tenant_onboarding_state</code> (stage=connecting)</p>
+    <p><strong>Idempotency:</strong> Upsert on <code>(tenant_id, erp_type)</code>; second call with same body is a no-op.</p>
+    <p><strong>Failure handling:</strong> Invalid <code>erp_type</code> → 400. Duplicate active connection → 409. Secrets Manager write failure → 500, no DB row written.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">ErpConnector.ping()</div>
+    <p><strong>Responsibility:</strong> Lightweight read test against the ERP API to confirm credentials work before committing to a full sync.</p>
+    <p><strong>Interface:</strong> <code>ErpConnector.ping(tenant_id) → {ok: bool, error?: string}</code></p>
+    <p><strong>Reads:</strong> Secrets Manager for credentials</p>
+    <p><strong>Writes:</strong> <code>tenant_erp_connections.status</code> → running or error</p>
+    <p><strong>Failure handling:</strong> Ping failure → set status=error, emit alert, stop pipeline. Retry not attempted automatically — admin must re-trigger.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">PeopleIngestionWorker (async)</div>
+    <p><strong>Responsibility:</strong> Paginate the ERP employee API (no page cap), normalise each employee record, upsert into <code>tenant_users</code>.</p>
+    <p><strong>Interface:</strong> <code>PeopleIngestionWorker.run(tenant_id, sync_type: 'full'|'delta') → void</code></p>
+    <p><strong>Normalisation output per employee:</strong> <code>{external_id, email, display_name, department, manager_id, raw_title, raw_jd_text, jd_source}</code></p>
+    <p><strong>Reads:</strong> ERP employee API (paginated)</p>
+    <p><strong>Writes:</strong> <code>tenant_users</code> upsert on <code>(tenant_id, external_id)</code></p>
+    <p><strong>Idempotency:</strong> Upsert; re-running the same page produces the same rows.</p>
+    <p><strong>Failure handling:</strong> ERP rate limit → exponential backoff per tenant. Single page failure → retry that page only; other pages continue. Employee with no usable JD → pass to JD Normalizer with fallback signals.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">JD Normalizer</div>
+    <p><strong>Responsibility:</strong> Extract responsibility chunks from the best available JD text; embed chunks; persist to <code>user_responsibilities</code>; stamp <code>jd_hash</code>.</p>
+    <p><strong>Fallback order:</strong> ERP JD text → job posting text → title + department template.</p>
+    <p><strong>Interface:</strong> <code>JDNormalizer.process(user_id, jd_text?, title, department) → {chunks: string[], jd_hash: string, jd_quality: 'ok'|'low'}</code></p>
+    <p><strong>Reads:</strong> <code>tenant_users</code></p>
+    <p><strong>Writes:</strong> <code>user_responsibilities</code> (chunks + embeddings), <code>tenant_users.jd_hash</code>, <code>tenant_users.jd_quality</code></p>
+    <p><strong>Idempotency:</strong> Keyed on <code>jd_hash</code>; unchanged JD skips re-embedding.</p>
+    <p><strong>Failure handling:</strong> LLM extraction failure → fall back to next source in order. All sources empty → bucket from title+department, flag <code>jd_quality=low</code>.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">SchemaDiscoveryWorker (parallel)</div>
+    <p><strong>Responsibility:</strong> Read <code>information_schema</code> on the client's read-only replica, embed table and column names, suggest mappings to generic aliases; persist after admin confirmation.</p>
+    <p><strong>Interface:</strong> <code>SchemaDiscoveryWorker.run(tenant_id) → {suggestions: MappingSuggestion[]}</code></p>
+    <p><strong>Reads:</strong> Client DB <code>information_schema</code> (read-only replica)</p>
+    <p><strong>Writes:</strong> <code>tenant_schema_registry</code> (partial — after admin confirm calls <code>fn_register_table</code>)</p>
+    <p><strong>Runs:</strong> In parallel with PeopleIngestionWorker steps 3–4.</p>
+    <p><strong>Failure handling:</strong> Read replica unreachable → log, skip, admin notified. Mapping suggestion errors do not block people sync.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">BucketMatchJob fan-out</div>
+    <p><strong>Responsibility:</strong> For every employee whose <code>jd_hash</code> changed since last sync, enqueue a <code>BucketMatchJob</code>.</p>
+    <p><strong>Interface:</strong> <code>fanOutBucketMatchJobs(tenant_id, changed_user_ids: string[]) → void</code></p>
+    <p><strong>Reads:</strong> <code>tenant_users.jd_hash</code> diff</p>
+    <p><strong>Writes:</strong> Job queue (Kafka topic / task queue)</p>
+    <p><strong>Idempotency:</strong> Duplicate enqueue is safe — BucketMatchJob is idempotent.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Delta sync scheduler</div>
+    <p><strong>Responsibility:</strong> Nightly cron that computes a content hash diff and skips unchanged employees to minimise LLM and DB writes.</p>
+    <p><strong>Interface:</strong> Cron expression — <code>DELTA_SYNC_CRON</code> config.</p>
+    <p><strong>Reads:</strong> <code>tenant_users.jd_hash</code> vs ERP current state</p>
+    <p><strong>Writes:</strong> Enqueues PeopleIngestionWorker delta run per tenant</p>
+    <p><strong>Failure handling:</strong> If ERP unreachable at cron time, retry window <span class="tbd">TBD</span>; alert after N failures.</p>
+  </div>
+
+  <!-- 5. Flow Diagram -->
+  <h2>4 · Flow Diagram</h2>
+  <div class="card">
+    <div class="mermaid" id="flow">
+sequenceDiagram
+    participant Admin
+    participant API
+    participant EC as ErpConnector
+    participant PIW as PeopleIngestionWorker
+    participant JDN as JD Normalizer
+    participant SDW as SchemaDiscoveryWorker
+    participant Fan as BucketMatchJob fan-out
+
+    Admin->>API: POST /api/tenants/{id}/connect
+    API->>API: Validate erp_type, store credentials
+    API->>EC: ping(tenant_id)
+    alt Ping fails
+        EC-->>API: error → status=error, stop
+    else Ping ok
+        EC-->>API: ok → status=running
+        API->>PIW: run(tenant_id, 'full')
+        API->>SDW: run(tenant_id) [parallel]
+        loop Paginate employees
+            PIW->>PIW: fetch page from ERP
+            PIW->>PIW: normalise → {external_id, email, …}
+            PIW->>JDN: process(user_id, jd_text, title, dept)
+            JDN->>JDN: fallback order → extract chunks → embed
+        end
+        PIW->>Fan: fanOutBucketMatchJobs(changed_user_ids)
+        Fan-->>Fan: enqueue BucketMatchJob per user_id
+    end
+    </div>
+  </div>
+
+  <!-- 6. State Machines — onboarding stage progression only, no formal SM -->
+  <h2>5 · Onboarding Stage Progression</h2>
+  <div class="state-machine">
+    <div class="mermaid" id="sm">
+flowchart LR
+    A([connecting]) --> B([people_synced])
+    B --> C([buckets_assigned])
+    C --> D([live])
+    </div>
+    <p style="margin-top:12px;font-size:0.875rem;color:var(--txt-muted)">Stored in <code>tenant_onboarding_state.stage</code>. Not a blocking state machine — stages advance via event writes, no guard transitions.</p>
+  </div>
+
+  <!-- 7. Redis Keys -->
+  <h2>6 · Redis Keys</h2>
+  <p style="color:var(--txt-muted);font-size:0.875rem">LLD 1 does not own any Redis keys directly. It triggers <code>BucketMatchJob</code> which may eventually warm the cache via LLD 2 → 3 → 7.</p>
+
+  <!-- 8. Tables Touched -->
+  <h2>7 · Tables Touched</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Table</th><th>Op</th><th>Schema anchor</th></tr></thead>
+      <tbody>
+        <tr><td><code>tenant_erp_connections</code></td><td>W (upsert)</td><td><a href="../schema.html#tenant_erp_connections">schema → tenant_erp_connections</a></td></tr>
+        <tr><td><code>tenant_onboarding_state</code></td><td>W (upsert)</td><td><a href="../schema.html#tenant_onboarding_state">schema → tenant_onboarding_state</a></td></tr>
+        <tr><td><code>tenant_users</code></td><td>W (upsert on tenant_id, external_id)</td><td><a href="../schema.html#tenant_users">schema → tenant_users</a></td></tr>
+        <tr><td><code>user_responsibilities</code></td><td>W (insert chunks + embeddings)</td><td><a href="../schema.html#user_responsibilities">schema → user_responsibilities</a></td></tr>
+        <tr><td><code>tenant_schema_registry</code></td><td>W partial (post admin confirm)</td><td><a href="../schema.html#tenant_schema_registry">schema → tenant_schema_registry</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Config Values -->
+  <h2>8 · Config Values</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Purpose</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>EMBEDDING_MODEL</code></td><td>Model used for JD chunk and schema embedding</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>JD_CHUNK_MIN_TOKENS</code></td><td>Minimum token count for a responsibility chunk to be stored</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>ERP_RATE_LIMIT_BACKOFF_BASE_MS</code></td><td>Base delay (ms) for exponential backoff on ERP 429 responses</td><td><span class="tbd">TBD</span></td></tr>
+        <tr><td><code>DELTA_SYNC_CRON</code></td><td>Cron expression for nightly delta sync</td><td><span class="tbd">TBD</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Dependencies -->
+  <h2>9 · Dependencies</h2>
+  <div class="table-wrap dep-table">
+    <table>
+      <thead><tr><th>Direction</th><th>LLD</th><th>What is exchanged</th></tr></thead>
+      <tbody>
+        <tr><td>Out →</td><td><a href="lld-02-bucket-matcher.html">LLD 2 — Bucket Matcher</a></td><td><code>BucketMatchJob(user_id)</code> enqueued per changed employee</td></tr>
+        <tr><td>Out →</td><td><a href="lld-08-data-resolver.html">LLD 8 — Data Resolver</a></td><td>Schema mappings written to <code>tenant_schema_registry</code></td></tr>
+        <tr><td>Out →</td><td><a href="lld-10-access-guard.html">LLD 10 — Access Guard</a></td><td>Employee metadata, department, manager hierarchy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 11. Edge Cases & Open Questions -->
+  <h2>10 · Edge Cases &amp; Open Questions</h2>
+  <div class="open-q">
+    <div class="open-q-title">Edge Cases</div>
+    <ul>
+      <li>Employee with completely empty JD and no department → bucketed from raw_title only, flagged <code>jd_quality=low</code>; bucket match quality degrades gracefully.</li>
+      <li>ERP pagination timeout mid-sync → retry that page only; employees already processed are not re-processed (jd_hash guard).</li>
+      <li>Duplicate <code>external_id</code> across sync runs (ERP reused an ID) → upsert overwrites the row; previous responsibility chunks are orphaned — <strong>open: should orphaned chunks be deleted or retained?</strong></li>
+      <li><code>manager_id</code> references a non-existent user → stored as-is; Access Guard resolves hierarchy lazily and handles missing nodes.</li>
+    </ul>
+  </div>
+  <div class="open-q">
+    <div class="open-q-title">Open Questions</div>
+    <ul>
+      <li>First ERP / HRIS integration target is undecided (SAP, Workday, BambooHR) — shapes connector interface priority.</li>
+      <li>Should orphaned <code>user_responsibilities</code> rows be deleted when a user's <code>external_id</code> is recycled by the ERP?</li>
+      <li>What is the retry window when the ERP is unreachable at scheduled cron time before alerting?</li>
+    </ul>
+  </div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  const body = document.body;
+  const toggleBtn = document.getElementById('dark-toggle');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  let darkMode = false;
+  const MERMAID_IDS = ['mini','flow','sm'];
+  const sources = {};
+  function captureSources() {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) sources[id] = el.textContent.trim();
+    });
+  }
+  function rerenderMermaid(theme) {
+    MERMAID_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.removeAttribute('data-processed');
+      el.innerHTML = sources[id];
+    });
+    mermaid.initialize({ startOnLoad: false, theme });
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+  }
+  function applyTheme(dark) {
+    darkMode = dark;
+    if (dark) {
+      body.classList.add('dark');
+      toggleIcon.textContent = '☀️';
+      toggleLabel.textContent = 'Light';
+      localStorage.setItem('theme','dark');
+    } else {
+      body.classList.remove('dark');
+      toggleIcon.textContent = '🌙';
+      toggleLabel.textContent = 'Dark';
+      localStorage.setItem('theme','light');
+    }
+    rerenderMermaid(dark ? 'dark' : 'neutral');
+  }
+  toggleBtn.addEventListener('click', () => applyTheme(!darkMode));
+  const saved = localStorage.getItem('theme');
+  mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+  document.addEventListener('DOMContentLoaded', () => {
+    captureSources();
+    mermaid.run({ nodes: MERMAID_IDS.map(id => document.getElementById(id)).filter(Boolean) });
+    if (saved === 'dark') applyTheme(true);
+  });
+</script>
+</body>
+</html>
